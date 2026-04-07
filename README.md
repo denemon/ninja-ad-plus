@@ -95,7 +95,7 @@ ninja-ad-plus/
 ## Security Considerations
 
 - **No remote code execution**: All rules are pre-compiled and bundled. No network fetches at runtime.
-- **No content script injection**: The extension does not inject scripts into pages.
+- **Page-context spoofing**: `spoofing.js` is injected at `document_start` in the page's MAIN world to stub common ad/anti-adblock globals. It is bundled locally and performs no remote code loading.
 - **No main_frame redirection**: Document-level rules are explicitly excluded to prevent forced navigation.
 - **Minimal permissions**: Only `declarativeNetRequest`, `declarativeNetRequestWithHostAccess`, and `storage` are requested.
 - **Domain whitelist**: Critical services (Google, YouTube) are protected from accidental blocking at the build step.

@@ -1,7 +1,7 @@
 {
   "name": "Ninja Ad (Stealth Switch)",
   "description": "Stealth ad blocker that redirects ad requests to empty responses instead of blocking them.",
-  "version": "10.0",
+  "version": "11.0",
   "manifest_version": 3,
   "permissions": [
     "declarativeNetRequest",
@@ -14,6 +14,14 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["spoofing.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_icon": "icon.png"

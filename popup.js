@@ -16,9 +16,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   toggleSwitch.addEventListener('change', async () => {
     const newState = toggleSwitch.checked;
-    await chrome.storage.local.set({ [STORAGE_KEY]: newState });
-    renderState(newState);
-    sendToggleMessage(newState);
+    const previousState = !newState;
+    toggleSwitch.disabled = true;
+    try {
+      const response = await sendToggleMessage(newState);
+      renderState(response.value);
+    } catch (error) {
+      console.warn('Toggle failed:', error);
+      renderState(previousState);
+    } finally {
+      toggleSwitch.disabled = false;
+    }
   });
 
   function renderState(isEnabled) {
@@ -30,10 +38,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function sendToggleMessage(value) {
-  chrome.runtime.sendMessage({ action: 'toggle', value }, () => {
-    if (!chrome.runtime.lastError) {
-      return;
-    }
-    console.warn('Toggle message failed:', chrome.runtime.lastError.message);
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ action: 'toggle', value }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (!response || response.status !== 'success') {
+        reject(new Error(response?.message || 'Toggle failed'));
+        return;
+      }
+      resolve(response);
+    });
   });
 }

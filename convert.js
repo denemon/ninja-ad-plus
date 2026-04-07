@@ -2,10 +2,11 @@
 
 const fs = require('fs');
 
-const INPUT_FILE = 'easylist.txt';
+const DEFAULT_INPUT_FILES = ['easylist.txt', 'antiadblockfilters.txt'];
 const OUTPUT_FILE = 'rules.json';
 const MAX_RULES = 280000;
 const MIN_URL_FILTER_LENGTH = 4;
+const MAX_URL_FILTER_LENGTH = 1024;
 const ASCII_PRINTABLE = /^[ -~]+$/;
 
 const WHITELIST_DOMAINS = Object.freeze([
@@ -30,7 +31,7 @@ const RESOURCE_TYPE_MAP = Object.freeze({
 
 const DEFAULT_RESOURCE_TYPES = Object.freeze([
   'script', 'image', 'xmlhttprequest', 'sub_frame', 'media', 'ping',
-  'font', 'stylesheet', 'websocket', 'other',
+  'font', 'stylesheet', 'websocket', 'other', 'object',
 ]);
 
 const NOOP_PATH = Object.freeze({
@@ -53,18 +54,30 @@ const PRIORITY_EXCEPTION = 2;
 
 // --- Main ---
 
-run();
+if (require.main === module) {
+  run();
+}
 
 function run() {
-  if (!fs.existsSync(INPUT_FILE)) {
-    console.error(`Error: ${INPUT_FILE} not found.`);
+  const inputFiles = process.argv.length > 2
+    ? process.argv.slice(2)
+    : DEFAULT_INPUT_FILES;
+
+  const existing = inputFiles.filter(f => fs.existsSync(f));
+  if (existing.length === 0) {
+    console.error(`Error: no input files found (tried: ${inputFiles.join(', ')})`);
     process.exit(1);
   }
 
+  console.log(`Input files: ${existing.join(', ')}`);
   console.log('EasyList -> declarativeNetRequest conversion started...');
 
-  const data = fs.readFileSync(INPUT_FILE, 'utf8');
-  const lines = data.split('\n');
+  const lines = [];
+  for (const file of existing) {
+    const data = fs.readFileSync(file, 'utf8');
+    lines.push(...data.split('\n'));
+  }
+
   const result = convertLines(lines);
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(result.rules));
@@ -109,20 +122,19 @@ function convertLines(lines) {
     }
 
     const parsed = parseLine(trimmed);
-
-    if (!isValidUrlFilter(parsed.urlFilter)) {
-      skipped.invalid++;
-      continue;
-    }
-    if (matchesWhitelistDomain(parsed.urlFilter)) {
-      skipped.whitelist++;
-      continue;
-    }
-
     const options = parseOptions(parsed.optionsStr);
 
     if (options.hasDocumentType || options.hasPopupType) {
       skipped.mainframe++;
+      continue;
+    }
+
+    if (!isValidRequestFilter(parsed)) {
+      skipped.invalid++;
+      continue;
+    }
+    if (matchesWhitelistDomain(parsed.filterValue)) {
+      skipped.whitelist++;
       continue;
     }
 
@@ -154,20 +166,114 @@ function classifyLine(trimmed) {
 function parseLine(trimmed) {
   const isException = trimmed.startsWith('@@');
   const rawRule = isException ? trimmed.slice(2) : trimmed;
+  const regexRule = parseRegexRule(rawRule);
+
+  if (regexRule) {
+    return { ...regexRule, isException };
+  }
+
   const lastDollar = rawRule.lastIndexOf('$');
 
-  if (lastDollar <= 0) {
-    return { urlFilter: rawRule, optionsStr: '', isException };
+  if (lastDollar === 0) {
+    return createParsedFilter('', rawRule.slice(1), isException, 'urlFilter');
   }
+  if (lastDollar <= 0) {
+    return createParsedFilter(rawRule, '', isException, 'urlFilter');
+  }
+  return createParsedFilter(
+    rawRule.substring(0, lastDollar),
+    rawRule.substring(lastDollar + 1),
+    isException,
+    'urlFilter'
+  );
+}
+
+function parseRegexRule(rawRule) {
+  if (!rawRule.startsWith('/')) {
+    return null;
+  }
+
+  const regexEnd = findRegexRuleEnd(rawRule);
+  if (regexEnd <= 0) {
+    return null;
+  }
+
+  const regexFilter = rawRule.slice(1, regexEnd);
+  const trailing = rawRule.slice(regexEnd + 1);
+
+  // Path-like EasyList filters can also be wrapped in slashes. Treat only
+  // escaped-slash regex bodies as regexFilter rules to avoid misclassifying
+  // common patterns such as /ads/$script.
+  if (!regexFilter.includes('\\')) {
+    return null;
+  }
+  if (trailing && !trailing.startsWith('$')) {
+    return null;
+  }
+
+  return createParsedFilter(regexFilter, trailing.slice(1), false, 'regexFilter');
+}
+
+function findRegexRuleEnd(rawRule) {
+  for (let index = rawRule.length - 1; index > 0; index--) {
+    if (rawRule[index] === '/' && !isEscaped(rawRule, index)) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function isEscaped(value, index) {
+  let backslashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === '\\'; cursor--) {
+    backslashCount++;
+  }
+  return backslashCount % 2 === 1;
+}
+
+function createParsedFilter(filterValue, optionsStr, isException, filterKey) {
   return {
-    urlFilter: rawRule.substring(0, lastDollar),
-    optionsStr: rawRule.substring(lastDollar + 1),
+    filterKey,
+    filterValue,
+    urlFilter: filterKey === 'urlFilter' ? filterValue : undefined,
+    regexFilter: filterKey === 'regexFilter' ? filterValue : undefined,
+    optionsStr,
     isException,
   };
 }
 
+function isValidRequestFilter(parsed) {
+  if (parsed.filterKey === 'regexFilter') {
+    return isValidRegexFilter(parsed.filterValue);
+  }
+  return isValidUrlFilter(parsed.filterValue);
+}
+
 function isValidUrlFilter(urlFilter) {
-  return ASCII_PRINTABLE.test(urlFilter) && urlFilter.length >= MIN_URL_FILTER_LENGTH;
+  return (
+    typeof urlFilter === 'string' &&
+    ASCII_PRINTABLE.test(urlFilter) &&
+    urlFilter.length >= MIN_URL_FILTER_LENGTH &&
+    urlFilter.length <= MAX_URL_FILTER_LENGTH &&
+    !urlFilter.startsWith('||*')
+  );
+}
+
+function isValidRegexFilter(regexFilter) {
+  if (
+    typeof regexFilter !== 'string' ||
+    !ASCII_PRINTABLE.test(regexFilter) ||
+    regexFilter.length === 0
+  ) {
+    return false;
+  }
+
+  try {
+    new RegExp(regexFilter);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function matchesWhitelistDomain(urlFilter) {
@@ -258,10 +364,10 @@ function resolveResourceTypes(options) {
 // --- Rule Building ---
 
 function buildRule(id, parsed, options, resourceTypes) {
-  const condition = buildCondition(parsed.urlFilter, options, resourceTypes);
+  const condition = buildCondition(parsed, options, resourceTypes);
   const action = parsed.isException
     ? { type: 'allow' }
-    : decideRedirectAction(parsed.urlFilter, resourceTypes);
+    : decideRedirectAction(parsed.filterValue, resourceTypes);
 
   return {
     id,
@@ -271,8 +377,11 @@ function buildRule(id, parsed, options, resourceTypes) {
   };
 }
 
-function buildCondition(urlFilter, options, resourceTypes) {
-  const condition = { urlFilter, resourceTypes };
+function buildCondition(parsed, options, resourceTypes) {
+  const condition = {
+    [parsed.filterKey]: parsed.filterValue,
+    resourceTypes,
+  };
 
   if (options.thirdParty === true) {
     condition.domainType = 'thirdParty';
@@ -329,3 +438,13 @@ function createRedirectAction(extensionPath) {
     redirect: { extensionPath },
   };
 }
+
+module.exports = Object.freeze({
+  convertLines,
+  parseLine,
+  parseOptions,
+  resolveResourceTypes,
+  buildRule,
+  isValidRequestFilter,
+  decideRedirectAction,
+});
