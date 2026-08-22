@@ -6,7 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-const SPOOFING_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'spoofing.js'), 'utf8');
+const SPOOFING_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'spoofing.js'), 'utf8');
 
 function createStyle() {
   const calls = [];
@@ -162,6 +162,61 @@ test('pre-existing googletag command queue is flushed once and wrapped once', ()
   });
 
   assert.equal(count, 2);
+});
+
+function createOverlay() {
+  return createElement({
+    textContent: 'Please disable your ad blocker to continue',
+    _computedStyle: { position: 'fixed', zIndex: '9999' },
+    getBoundingClientRect() { return { width: 1000, height: 1000 }; },
+  });
+}
+
+test('an overlay injected after the first pass is still removed', () => {
+  const candidates = [];
+  const { context, timers, listeners } = createSpoofingContext(candidates);
+
+  runSpoofing(context);
+  listeners.load();
+
+  // First pass at 500ms: the page has nothing on it yet.
+  timers.shift()();
+
+  const overlay = createOverlay();
+  candidates.push(overlay);
+
+  // Second pass at 2500ms must still run, or a late overlay is missed forever.
+  timers.shift()();
+
+  assert.deepEqual(
+    overlay.style.calls.filter(call => call.name === 'display'),
+    [{ name: 'display', value: 'none', priority: 'important' }]
+  );
+});
+
+test('hidden UI whose name merely starts with "ad" is left alone', () => {
+  const { context, observers } = createSpoofingContext();
+  runSpoofing(context);
+
+  const hidden = { display: 'none', visibility: 'hidden', opacity: '0' };
+  const untouched = ['address', 'admin-dialog', 'adaptive-layout', 'bannerman', 'sponsorship']
+    .map(name => createElement({ className: name, _computedStyle: hidden }));
+  const bait = ['ads', 'ad-banner', 'adBanner', 'ads_top', 'banner-left']
+    .map(name => createElement({ className: name, _computedStyle: hidden }));
+
+  for (const observer of observers) {
+    observer.callback([{ type: 'childList', addedNodes: [...untouched, ...bait], target: context.document.body }]);
+  }
+
+  for (const el of untouched) {
+    assert.deepEqual(el.style.calls, [], `${el.className} must not be force-shown`);
+  }
+  for (const el of bait) {
+    assert.ok(
+      el.style.calls.some(call => call.name === 'display' && call.value === 'block'),
+      `${el.className} should still be protected as bait`
+    );
+  }
 });
 
 test('overlay cleanup does not unlock scrolling when no overlay is found', () => {

@@ -1,0 +1,57 @@
+{
+  "name": "Ninja Ad (Stealth Switch)",
+  "description": "Stealth ad blocker with automatic YouTube ad skipping.",
+  "version": "11.3",
+  "manifest_version": 3,
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["youtube.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "core",
+        "enabled": false,
+        "path": "rules-core.json"
+      },
+      {
+        "id": "extended",
+        "enabled": false,
+        "path": "rules-extended.json"
+      }
+    ]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["noop.js", "noop.gif", "noop.css", "noop.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

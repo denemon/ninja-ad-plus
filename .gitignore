@@ -1,14 +1,11 @@
-# Exclude all dotfiles
+# Exclude all dotfiles (covers .DS_Store and local editor/tool state)
 .*
 
 # Track .gitignore itself
 !.gitignore
 
-# Chrome-generated extension metadata
+# Chrome-generated extension metadata (written into src/ when loaded unpacked)
 _metadata/
 
 # Node test/development dependencies
 node_modules/
-
-# Claude Code session logs
-.claude/log/
