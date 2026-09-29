@@ -1,5 +1,8 @@
 {
   "scripts": {
     "test": "node --test"
+  },
+  "devDependencies": {
+    "@adguard/re2-wasm": "^1.2.1"
   }
 }

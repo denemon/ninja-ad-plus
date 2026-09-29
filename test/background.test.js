@@ -142,7 +142,6 @@ test('toggle message applies ruleset before persisting state', async () => {
   assert.equal(storage.isEnabled, false);
   assert.equal(JSON.stringify(updates), JSON.stringify([
     { disableRulesetIds: ['core'] },
-    { disableRulesetIds: ['extended'] },
   ]));
 });
 
@@ -167,19 +166,6 @@ test('a slow startup sync cannot re-enable anything after a later OFF toggle', a
   assert.equal(badge.text, 'OFF');
 });
 
-test('losing the extended ruleset to quota does not fail the toggle', async () => {
-  const { listeners, storage, updates, failRuleset } = createBackgroundContext();
-  failRuleset('extended', 'rule count limit exceeded');
-
-  const response = await sendToggle(listeners, true);
-
-  assert.equal(response.status, 'success', 'core blocking is up, so the toggle succeeded');
-  assert.equal(storage.isEnabled, true);
-  assert.equal(JSON.stringify(updates), JSON.stringify([
-    { enableRulesetIds: ['core'] },
-  ]));
-});
-
 test('a failed core ruleset update leaves nothing enabled and is reported', async () => {
   const { listeners, storage, failRuleset } = createBackgroundContext();
   failRuleset('core', 'rule count limit exceeded');
@@ -189,21 +175,6 @@ test('a failed core ruleset update leaves nothing enabled and is reported', asyn
   assert.equal(response.status, 'error');
   assert.equal(response.message, 'rule count limit exceeded');
   assert.equal(storage.isEnabled, undefined, 'a failed toggle must not be persisted');
-});
-
-test('a failed extended disable is fatal and rolls back to the stored ON state', async () => {
-  const { listeners, storage, enabledRulesets, registeredScripts, failRuleset } =
-    createBackgroundContext({ spoofingRegistered: true });
-  storage.isEnabled = true;
-  enabledRulesets.add('core').add('extended');
-  failRuleset('extended', 'internal error');
-
-  const response = await sendToggle(listeners, false);
-
-  assert.equal(response.status, 'error', 'extended rules are still live, so OFF did not happen');
-  assert.equal(storage.isEnabled, true, 'the stored ON state must survive');
-  assert.ok(enabledRulesets.has('core'), 'core must be rolled back on to match storage');
-  assert.ok(registeredScripts.has('spoofing'), 'spoofing must be rolled back on to match storage');
 });
 
 test('a partial failure re-derives every component from the stored state', async () => {

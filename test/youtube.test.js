@@ -29,7 +29,10 @@ test('skips a playing YouTube ad and stops when the extension is disabled', asyn
     document: {
       documentElement: {},
       addEventListener() {},
-      querySelector() { return player; },
+      querySelector(selector) {
+        assert.equal(selector, '#movie_player.ad-showing, #movie_player.ad-interrupting');
+        return player;
+      },
       querySelectorAll() { return [{ remove() { removed = true; } }]; },
     },
     chrome: {
@@ -49,4 +52,53 @@ test('skips a playing YouTube ad and stops when the extension is disabled', asyn
 
   storageListener({ isEnabled: { newValue: false } }, 'local');
   assert.equal(disconnected, true);
+});
+
+test('removes mobile and Shorts ad containers instead of leaving empty cards', async () => {
+  let adSelector;
+  let shortsRemoved = false;
+  let mobileRemoved = false;
+  const shortsContainer = { remove() { shortsRemoved = true; } };
+  const mobileContainer = { remove() { mobileRemoved = true; } };
+
+  const context = {
+    requestAnimationFrame(callback) { callback(); },
+    MutationObserver: class { observe() {} },
+    document: {
+      documentElement: {},
+      addEventListener() {},
+      querySelector() { return null; },
+      querySelectorAll(selector) {
+        adSelector = selector;
+        return [
+          {
+            closest(containerSelector) {
+              assert.ok(containerSelector.split(',').includes('.ytd-shorts'));
+              return shortsContainer;
+            },
+          },
+          {
+            closest(containerSelector) {
+              assert.ok(containerSelector.split(',').includes('ytm-rich-item-renderer'));
+              return mobileContainer;
+            },
+          },
+        ];
+      },
+    },
+    chrome: {
+      storage: {
+        local: { async get(defaults) { return defaults; } },
+        onChanged: { addListener() {} },
+      },
+    },
+  };
+
+  vm.runInNewContext(SOURCE, context, { filename: 'youtube.js' });
+  await Promise.resolve();
+
+  assert.ok(adSelector.split(',').includes('ad-slot-renderer'));
+  assert.ok(adSelector.split(',').includes('ytm-companion-ad-renderer'));
+  assert.equal(shortsRemoved, true);
+  assert.equal(mobileRemoved, true);
 });

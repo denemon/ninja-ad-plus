@@ -85,11 +85,10 @@ protects it three ways:
   still in storage (`syncStateFromStorage`) and reports an error, rather than
   claiming a switch that did not happen.
 
-Failure tolerance is deliberately asymmetric. Losing the extended ruleset to
-quota **while enabling** is survivable and only costs blocking coverage. A
-failure **while disabling** is fatal and rolls back: disabling never competes
-for quota, so a rejection there means the rules are still live, and reporting
-success would leave ~144,000 rules running against a stored OFF.
+Every ruleset failure is fatal and rolls back. That is affordable because the
+whole ruleset fits inside Chrome's per-extension guarantee, so enabling it
+cannot be rejected for quota; a rejection means something genuinely went wrong,
+and reporting success would leave rules running against a stored OFF.
 
 ## Installation
 
@@ -107,18 +106,33 @@ patching off.
 
 ## Updating Filter Rules
 
-The extension uses [EasyList](https://easylist.to/) as its filter source. To update:
+Every `.txt` in `filters/` is a source; the converter reads them all. EasyList is
+international and carries almost no Japanese ad networks, which is why the
+AdGuard Japanese filter is bundled alongside it — hosts like `caprofitx.com` and
+`flux-cdn.com` appear in neither EasyList nor the anti-adblock list, and a
+Japanese news page can be served almost entirely by SSPs EasyList never names.
+Add a regional list per language you care about.
 
-1. Download the latest `easylist.txt` from [https://easylist.to/easylist/easylist.txt](https://easylist.to/easylist/easylist.txt).
-2. Place it in `filters/`.
-3. Run the converter, which writes both generated rulesets into `src/`:
+| File | Source |
+|---|---|
+| `easylist.txt` | [easylist.to/easylist/easylist.txt](https://easylist.to/easylist/easylist.txt) |
+| `antiadblockfilters.txt` | [easylist.to/easylist/antiadblockfilters.txt](https://easylist.to/easylist/antiadblockfilters.txt) |
+| `adguard-japanese.txt` | [filters.adtidy.org/extension/ublock/filters/7.txt](https://filters.adtidy.org/extension/ublock/filters/7.txt) |
+
+Download the current versions into `filters/`, then:
 
 ```bash
 node convert.js
 npm test
 ```
 
-4. Reload the extension in `chrome://extensions/`.
+The converter writes `src/rules-core.json` and **fails** if the result exceeds
+Chrome's 30,000-rule guarantee, rather than shipping a ruleset that competes for
+the shared global pool. Then reload the extension in `chrome://extensions/`.
+
+Use the uBlock Origin variant of any AdGuard list (`/extension/ublock/`). Its
+scriptlet syntax is `##+js(...)`, which the converter classifies as cosmetic and
+skips; the native AdGuard `#%#` form would not be recognised.
 
 ### Converter Output
 
@@ -184,50 +198,55 @@ rerun the converter.
 | 2 | Exception (`@@`) rule | Allow (bypasses block) |
 | 3 | Whitelist guard (one rule) | Allow (bypasses everything) |
 
-### Two Rulesets and Chrome's Static Rule Budget
+### Domain Merging and Chrome's Static Rule Budget
 
-Chrome guarantees only **30,000** static rules per extension. EasyList currently
-yields ~174,000 rules (about 58,000 filters, most emitted once per noop group),
-and the surplus is drawn from a pool shared with every other installed
-extension.
+Chrome guarantees only **30,000** static rules per extension. Anything past that
+is drawn from a pool shared with every other installed extension, and
+`updateEnabledRulesets()` is **atomic**: if enabling a ruleset would push the
+count past what that pool can spare, the call is rejected and *no* change is
+made. Chrome does not load the rules that fit and drop the rest. An oversized
+ruleset is all-or-nothing — one unlucky quota check and the extension blocks
+nothing at all, for a reason that depends on what else the user has installed.
 
-Critically, `updateEnabledRulesets()` is **atomic**: if enabling a ruleset would
-push the count past what that shared pool can spare, the call is rejected and
-*no* change is made. Chrome does not load the rules that fit and drop the rest.
-A single 174,000-rule ruleset would be all-or-nothing — one unlucky quota check
-and the extension blocks nothing at all.
+The bundled lists are ~93% filters of the form `||host^`: a whole host blocked
+outright, with no path and no options. That is precisely what a DNR
+`requestDomains` condition expresses, and **one rule can carry a whole list of
+hosts**. Merging them collapses ~166,000 domain blocks into **30 rules**:
 
-The converter splits the output accordingly:
+| | Rules |
+|---|---|
+| One rule per filter per noop target | ~178,000 |
+| With `||host^` filters merged | **~12,300** |
 
-| Ruleset | Rules | Enabled | Failure impact |
-|---|---|---|---|
-| `rules-core.json` | 30,000: the guard rule, **every** exception rule, then one `noop.js` rule per filter | `false` in the manifest; `background.js` enables it from the stored state | Cannot be rejected for quota — it fits inside the guarantee |
-| `rules-extended.json` | the remainder (~144,000) | `false`; `background.js` enables it best-effort | Reduced blocking coverage, logged as a warning |
+The entire ruleset now fits inside the guarantee with room to spare, so there is
+a single `rules-core.json` and enabling it can never be rejected for quota.
+`convert.js` fails the build if the output ever exceeds 30,000 rather than
+silently shipping a truncated ruleset, and `test/static-rules.test.js` asserts
+the same bound.
 
-**Rules are emitted noop group by noop group, not filter by filter.** Both orders
-produce identical rules; only the core/extended boundary moves. Filter-major
-ordering would spend the guaranteed 30,000 on every variant of the first ~7,500
-filters. Group-major ordering spends it on the `noop.js` variant of ~29,400
-filters instead and leaves the image, sub-frame and stylesheet variants to the
-extended ruleset. That is the better failure mode in both directions: blocking an
-ad's script usually prevents its image request from ever being made, and if the
-extended ruleset cannot be enabled the type-specific rules simply do not match,
-so those requests proceed untouched rather than being answered with the wrong
-content type.
+Merging is deliberately conservative. A filter only qualifies if it is a bare
+lowercase host with a trailing `^` and no `$domain=`:
 
-All exception (`allow`) rules go in the core ruleset. An exception stranded in
-the droppable half would let core block rules fire with nothing to override
-them, which is how sites break. `convert.js` fails the build if the exceptions
-alone ever exceed the guarantee, and the split is asserted in
-`test/static-rules.test.js`.
+- **No trailing `^`** — `||ad.example` also matches `ad.example.evil.net`, which
+  `requestDomains` would not. Merging it would silently narrow the filter.
+- **Ports, wildcards, paths** — `requestDomains` takes a bare domain and cannot
+  express any of them.
+- **`$domain=`** — `initiatorDomains` constrains the *calling page*, so sharing a
+  rule would apply one filter's page restriction to every other host in it.
 
-Rule matching and priorities apply across all enabled rulesets, so a priority-2
-`allow` in the core ruleset still overrides a priority-1 `redirect` in the
-extended one.
+Buckets also key on the noop target, the first/third-party constraint and the
+resource types, since a merged rule cannot vary those per host. Everything that
+fails to qualify keeps its own `urlFilter` rule.
 
-### Neither Ruleset Is Enabled From the Manifest
+Rules are ordered by how much each covers, so if the ruleset ever does overflow,
+the cheapest thing to lose is last: the whitelist guard, then **every** exception
+(`allow`) rule, then the merged whole-network blocks, then the per-filter rules.
+An exception stranded past a truncation would let block rules fire with nothing
+to override them, which is how sites break.
 
-Both `rule_resources` entries declare `"enabled": false`, and `background.js`
+### The Ruleset Is Not Enabled From the Manifest
+
+The `rule_resources` entry declares `"enabled": false`, and `background.js`
 switches them on from the stored ON/OFF state. This is required, not stylistic.
 Chrome persists the enabled ruleset set across sessions **but not across
 extension updates** — *"the `rule_resources` manifest key will determine the set
@@ -261,8 +280,7 @@ ninja-ad-plus/
 │   ├── youtube.js              # YouTube video-ad skipper and page ad cleanup
 │   ├── popup.html              # Popup UI: toggle switch with status indicator
 │   ├── popup.js                # Popup controller: reads/writes state, sends toggle messages
-│   ├── rules-core.json         # Generated: 30k rules incl. all exceptions, enabled from stored state
-│   ├── rules-extended.json     # Generated: overflow rules, enabled best-effort
+│   ├── rules-core.json         # Generated: ~12k rules incl. all exceptions, enabled from stored state
 │   ├── noop.js                 # Empty JS (script, XHR, ping, object, other)
 │   ├── noop.gif                # 1x1 transparent GIF (image ads)
 │   ├── noop.css                # Empty CSS (explicit $stylesheet filters only)
@@ -270,10 +288,11 @@ ninja-ad-plus/
 │   ├── icon48.png              # Toolbar icon
 │   └── icon128.png             # Extension management page icon
 ├── filters/                    # Build inputs, never shipped
-│   ├── easylist.txt            # EasyList filter source
-│   └── antiadblockfilters.txt  # Anti-adblock filter source
+│   ├── easylist.txt            # EasyList filter source (international)
+│   ├── antiadblockfilters.txt  # Anti-adblock filter source
+│   └── adguard-japanese.txt    # AdGuard Japanese filter: JP ad networks EasyList omits
 ├── test/                       # node --test suites
-├── convert.js                  # Build step: filters/*.txt -> src/rules-{core,extended}.json
+├── convert.js                  # Build step: filters/*.txt -> src/rules-core.json
 ├── icon-source.png             # Full-resolution icon artwork (icon48/128 are generated from it)
 ├── package.json                # `npm test`
 ├── .gitignore

@@ -2,18 +2,35 @@
 
 const fs = require('fs');
 const path = require('path');
+const { RE2 } = require('@adguard/re2-wasm');
 
-const DEFAULT_INPUT_FILES = ['filters/easylist.txt', 'filters/antiadblockfilters.txt'];
+// EasyList is international and carries almost no Japanese ad networks, so a
+// regional list is what covers hosts like caprofitx.com and flux-cdn.com.
+const DEFAULT_INPUT_FILES = [
+  'filters/easylist.txt',
+  'filters/antiadblockfilters.txt',
+  'filters/adguard-japanese.txt',
+];
 const CORE_OUTPUT_FILE = 'src/rules-core.json';
-const EXTENDED_OUTPUT_FILE = 'src/rules-extended.json';
-const MAX_RULES = 280000;
 
-// Chrome guarantees this many static rules per extension. Rules past it are
-// drawn from a pool shared with every other installed extension.
+// Chrome guarantees this many static rules per extension; anything past it is
+// drawn from a pool shared with every other installed extension, so enabling
+// can be rejected for reasons the user has no way to see. Merging the ||host^
+// filters brings the whole ruleset to roughly a third of the guarantee, so the
+// build now treats the guarantee as a hard cap and fails rather than quietly
+// shipping a ruleset that competes for the shared pool.
 const GUARANTEED_STATIC_RULES = 30000;
 const MIN_URL_FILTER_LENGTH = 4;
 const MAX_URL_FILTER_LENGTH = 1024;
 const ASCII_PRINTABLE = /^[ -~]+$/;
+
+// Chrome compiles each regexFilter with RE2 capped at 2KB of program memory
+// and skips any rule over the cap at install time, leaving a load error on
+// chrome://extensions. Counted repetitions expand at compile time, so a
+// 40-character pattern like (https?:\/\/)\w{30,}\.me\/\w{30,}\. still blows
+// the cap. The written length says nothing about the compiled size, so the
+// only reliable check is compiling with the same engine and limit.
+const DNR_REGEX_MAX_MEM = 2048;
 
 const WHITELIST_DOMAINS = Object.freeze([
   'google.com', 'google.co.jp', 'gstatic.com', 'googleapis.com',
@@ -56,9 +73,8 @@ const RESOURCE_TYPE_MAP = Object.freeze({
 // rule carries a single action, a filter spanning several groups needs one rule
 // per group.
 //
-// Group order is load-bearing twice over: convertLines emits group by group and
-// both the core/extended boundary and the MAX_RULES cut fall wherever that
-// sequence reaches. Most valuable first, so the cheapest thing to lose is last.
+// Group order decides what an overflowing ruleset would drop first, so the most
+// valuable noop leads and the cheapest thing to lose is last.
 const NOOP_GROUPS = Object.freeze([
   // Scripts need parseable JavaScript. The rest have no content requirement and
   // no load-failure event to observe, so text/javascript is undetectable there.
@@ -102,6 +118,25 @@ const PRIORITY_BLOCK = 1;
 const PRIORITY_EXCEPTION = 2;
 const PRIORITY_WHITELIST = 3;
 
+// A filter that is nothing but ||host^ says exactly what requestDomains says,
+// and a single rule can carry a whole list of hosts. The bundled lists are ~93%
+// such filters, so merging them collapses ~55,000 rules into a handful. That is
+// what lets every rule fit inside Chrome's per-extension guarantee: emitted one
+// by one they overflowed it four times over, and whichever networks fell past
+// the cut -- adingo.jp and g.doubleclick.net among them -- were blocked only on
+// a best-effort basis, in list order rather than by any measure of importance.
+//
+// Only a bare lowercase domain qualifies. Ports, wildcards, paths and
+// underscores are excluded because requestDomains cannot express them, and a
+// missing trailing ^ is excluded because ||ad.com without one also matches
+// ad.comcast.net, which requestDomains would not.
+const PURE_DOMAIN_FILTER = /^\|\|([a-z0-9.-]+)\^$/i;
+
+// Chrome documents no cap on requestDomains, and the merged lists stay well
+// under any plausible one, but a rejected ruleset costs all blocking at once.
+// ponytail: fixed chunk size, revisit only if Chrome documents a real limit.
+const MAX_MERGED_DOMAINS = 10000;
+
 // --- Main ---
 
 function run() {
@@ -126,41 +161,35 @@ function run() {
 
   const result = convertLines(lines);
 
-  const { core, extended } = splitRules(result.rules);
-  fs.writeFileSync(path.join(__dirname, CORE_OUTPUT_FILE), JSON.stringify(core));
-  fs.writeFileSync(path.join(__dirname, EXTENDED_OUTPUT_FILE), JSON.stringify(extended));
-  printSummary(result, core, extended);
+  assertFitsGuarantee(result.rules);
+  fs.writeFileSync(path.join(__dirname, CORE_OUTPUT_FILE), JSON.stringify(result.rules));
+  printSummary(result);
 }
 
-// updateEnabledRulesets() is atomic: if enabling a ruleset would push the
-// count past what the shared global pool can spare, the whole call is rejected
-// and nothing is enabled. A single oversized ruleset therefore risks losing all
-// blocking at once. Keeping the core ruleset inside the per-extension guarantee
-// makes it immune to that rejection, so the extended ruleset can fail on its
-// own and cost only blocking coverage.
-function splitRules(rules) {
-  const exceptions = rules.filter(rule => rule.action.type === 'allow').length;
-  if (exceptions > GUARANTEED_STATIC_RULES) {
+// updateEnabledRulesets() is atomic: if enabling a ruleset would push the count
+// past what the shared global pool can spare, the whole call is rejected and
+// nothing is enabled -- all blocking lost at once, for a reason that depends on
+// what else the user has installed. Staying inside the per-extension guarantee
+// makes that rejection impossible. Failing the build is the point: silently
+// truncating would ship a ruleset whose coverage nobody chose.
+function assertFitsGuarantee(rules) {
+  if (rules.length > GUARANTEED_STATIC_RULES) {
     throw new Error(
-      `${exceptions} exception rules exceed the ${GUARANTEED_STATIC_RULES}-rule guarantee; ` +
-      'they cannot all fit in the core ruleset.'
+      `${rules.length} rules exceed the ${GUARANTEED_STATIC_RULES}-rule per-extension ` +
+      'guarantee, so enabling them would compete for the shared global pool.'
     );
   }
-
-  return {
-    core: rules.slice(0, GUARANTEED_STATIC_RULES),
-    extended: rules.slice(GUARANTEED_STATIC_RULES),
-  };
 }
 
-function printSummary(result, core, extended) {
+function printSummary(result) {
   const allowCount = result.rules.filter(r => r.action.type === 'allow').length;
-  const redirectCount = result.rules.length - allowCount;
+  const merged = result.rules.filter(r => r.condition.requestDomains && r.action.type === 'redirect');
+  const mergedDomains = merged.reduce((total, rule) => total + rule.condition.requestDomains.length, 0);
 
   console.log(`Done: ${result.rules.length} rules generated`);
-  console.log(`  allow: ${allowCount} / redirect: ${redirectCount}`);
-  console.log(`  ${CORE_OUTPUT_FILE}: ${core.length} rules (always enabled, all exceptions)`);
-  console.log(`  ${EXTENDED_OUTPUT_FILE}: ${extended.length} rules (best-effort, shared global pool)`);
+  console.log(`  allow: ${allowCount} / redirect: ${result.rules.length - allowCount}`);
+  console.log(`  ${mergedDomains} domain blocks merged into ${merged.length} rules`);
+  console.log(`  ${CORE_OUTPUT_FILE}: ${result.rules.length} / ${GUARANTEED_STATIC_RULES} guaranteed rules`);
   console.log(
     `Skipped: comment=${result.skipped.comment}, cosmetic=${result.skipped.cosmetic}, ` +
     `invalid=${result.skipped.invalid}, whitelist=${result.skipped.whitelist}, ` +
@@ -174,11 +203,10 @@ function convertLines(lines) {
   const candidates = [];
   const skipped = { comment: 0, cosmetic: 0, invalid: 0, whitelist: 0, mainframe: 0, unsupported: 0 };
 
+  // Every line is read. A candidate is not a rule any more -- tens of thousands
+  // of them merge into one -- so capping candidates would throw away filters
+  // that cost nothing to keep.
   for (const line of lines) {
-    if (candidates.length >= MAX_RULES) {
-      break;
-    }
-
     const trimmed = line.trim();
     const classification = classifyLine(trimmed);
 
@@ -226,22 +254,43 @@ function convertLines(lines) {
   return { rules: buildRules(candidates), skipped };
 }
 
-// Exceptions come first so they take the lowest ids and land in the core
-// ruleset, where they can oppose the block rules Chrome always has enabled.
-// They are never split by noop target: an allow rule carries no response.
-//
-// Block rules are then emitted group by group rather than filter by filter.
-// Both orders produce the same rules; only the core/extended boundary moves.
-// Filter-major would give core 30,000 rules covering a quarter as many filters,
-// each with all four of its type variants. Group-major spends core on the
-// /noop.js variant of as many filters as fit and leaves the image, stylesheet
-// and frame variants to the extended ruleset. If extended cannot be enabled
-// those requests simply match nothing and proceed untouched: less blocking, but
-// no wrong-MIME failure for a page to notice — the safe direction to fail.
+// Ordered by how much each rule covers, so if the ruleset ever overflows again
+// the cheapest thing to lose is last. Exceptions first: a block rule left
+// standing without the exception opposing it breaks sites, and an allow rule is
+// never split by noop target because it carries no response. Then the merged
+// whole-network blocks — a few dozen rules covering the overwhelming majority
+// of ad traffic. Per-filter rules last: thousands of them, each covering one
+// path on one host.
 function buildRules(candidates) {
-  const emitted = candidates
-    .filter(candidate => candidate.parsed.isException)
-    .map(candidate => ({ candidate, resourceTypes: candidate.resourceTypes, noopPath: null }));
+  const { merged, perFilter } = groupBlocks(candidates);
+  const rules = [buildWhitelistGuardRule(1)];
+
+  for (const candidate of candidates) {
+    if (candidate.parsed.isException) {
+      rules.push(buildRule(
+        rules.length + 1, candidate.parsed, candidate.options, candidate.resourceTypes, null
+      ));
+    }
+  }
+  for (const bucket of merged) {
+    for (const domains of chunk([...bucket.domains], MAX_MERGED_DOMAINS)) {
+      rules.push(buildDomainRule(rules.length + 1, domains, bucket));
+    }
+  }
+  for (const { candidate, resourceTypes, noopPath } of perFilter) {
+    rules.push(buildRule(rules.length + 1, candidate.parsed, candidate.options, resourceTypes, noopPath));
+  }
+
+  return rules;
+}
+
+// Blocks are walked group by group rather than filter by filter, so a filter
+// spanning several noop targets contributes to each group's bucket separately.
+// Buckets key on everything a merged rule cannot vary per domain: the noop it
+// redirects to, the first/third-party constraint, and the resource types.
+function groupBlocks(candidates) {
+  const merged = new Map();
+  const perFilter = [];
 
   for (const group of NOOP_GROUPS) {
     for (const candidate of candidates) {
@@ -249,18 +298,57 @@ function buildRules(candidates) {
         continue;
       }
       const resourceTypes = candidate.resourceTypes.filter(type => group.types.includes(type));
-      if (resourceTypes.length > 0) {
-        emitted.push({ candidate, resourceTypes, noopPath: group.path });
+      if (resourceTypes.length === 0) {
+        continue;
       }
+
+      const domain = mergeableDomain(candidate);
+      if (domain === null) {
+        perFilter.push({ candidate, resourceTypes, noopPath: group.path });
+        continue;
+      }
+
+      const key = `${group.path} ${candidate.options.thirdParty} ${resourceTypes.join(',')}`;
+      const bucket = merged.get(key);
+      if (bucket) {
+        bucket.domains.add(domain);
+        continue;
+      }
+      merged.set(key, {
+        domains: new Set([domain]),
+        thirdParty: candidate.options.thirdParty,
+        resourceTypes,
+        noopPath: group.path,
+      });
     }
   }
 
-  const rules = [buildWhitelistGuardRule(1)];
-  for (const { candidate, resourceTypes, noopPath } of emitted.slice(0, MAX_RULES - rules.length)) {
-    rules.push(buildRule(rules.length + 1, candidate.parsed, candidate.options, resourceTypes, noopPath));
+  return { merged: [...merged.values()], perFilter };
+}
+
+// $domain= filters stay per-filter: initiatorDomains constrains the calling
+// page, so sharing a rule would apply one filter's page restriction to every
+// other domain in it.
+function mergeableDomain(candidate) {
+  const { parsed, options } = candidate;
+
+  if (parsed.filterKey !== 'urlFilter') {
+    return null;
+  }
+  if (options.includeDomains.length > 0 || options.excludeDomains.length > 0) {
+    return null;
   }
 
-  return rules;
+  const match = PURE_DOMAIN_FILTER.exec(parsed.filterValue);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function chunk(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }
 
 // The build-time domain scan only catches filters that spell a whitelisted
@@ -389,6 +477,13 @@ function isValidUrlFilter(urlFilter) {
   );
 }
 
+// Mirrors Chrome's own compile of a regexFilter: RE2 (which also rejects the
+// lookaheads and backreferences declarativeNetRequest cannot use), the 2KB
+// program-memory cap, case-insensitive (the isUrlFilterCaseSensitive default),
+// and capture groups neutralised the way Chrome's never_capture option does.
+// Validated against chrome.declarativeNetRequest.isRegexSupported() on every
+// regex the bundled filter lists produce: no over-limit pattern gets through,
+// at the cost of rejecting two borderline patterns Chrome would accept.
 function isValidRegexFilter(regexFilter) {
   if (
     typeof regexFilter !== 'string' ||
@@ -399,7 +494,8 @@ function isValidRegexFilter(regexFilter) {
   }
 
   try {
-    new RegExp(regexFilter);
+    const noCapture = regexFilter.replace(/(\\.)|\((?!\?)/g, (match, escaped) => escaped || '(?:');
+    new RE2(noCapture, 'iu', DNR_REGEX_MAX_MEM);
     return true;
   } catch (_) {
     return false;
@@ -535,6 +631,26 @@ function buildRule(id, parsed, options, resourceTypes, noopPath) {
   };
 }
 
+// The merged counterpart of buildRule: same action and priority, but the hosts
+// live in requestDomains instead of one ||host^ urlFilter per rule.
+function buildDomainRule(id, domains, bucket) {
+  const condition = { requestDomains: domains, resourceTypes: bucket.resourceTypes };
+
+  if (bucket.thirdParty === true) {
+    condition.domainType = 'thirdParty';
+  }
+  if (bucket.thirdParty === false) {
+    condition.domainType = 'firstParty';
+  }
+
+  return {
+    id,
+    priority: PRIORITY_BLOCK,
+    action: { type: 'redirect', redirect: { extensionPath: bucket.noopPath } },
+    condition,
+  };
+}
+
 function buildCondition(parsed, options, resourceTypes) {
   const condition = {
     [parsed.filterKey]: parsed.filterValue,
@@ -567,7 +683,7 @@ if (require.main === module) {
 
 module.exports = Object.freeze({
   convertLines,
-  splitRules,
+  assertFitsGuarantee,
   parseLine,
   parseOptions,
   resolveResourceTypes,

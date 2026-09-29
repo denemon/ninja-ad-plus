@@ -9,6 +9,7 @@ const ROOT = path.resolve(__dirname, '..', 'src');
 const ASCII_PRINTABLE = /^[ -~]+$/;
 const URL_FILTER_REGEX_LEFTOVER = /^\/.+\/[a-z]*$/i;
 const GUARANTEED_STATIC_RULES = 30000;
+const HOSTNAME = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
 
 function readJson(fileName) {
   return JSON.parse(fs.readFileSync(path.join(ROOT, fileName), 'utf8'));
@@ -73,16 +74,18 @@ test('spoofing.js is registered dynamically so the toggle can disable it', () =>
   assert.ok(fs.existsSync(path.join(ROOT, 'spoofing.js')));
 });
 
-test('the core ruleset fits Chrome\'s guarantee', () => {
+test('every static rule fits inside Chrome\'s guarantee', () => {
   const manifest = readJson('manifest.json');
-  const [core, extended] = manifest.declarative_net_request.rule_resources;
+  const rulesets = manifest.declarative_net_request.rule_resources;
+  const total = rulesets.reduce((count, ruleset) => count + readJson(ruleset.path).length, 0);
 
-  assert.equal(core.id, 'core');
-  assert.equal(extended.id, 'extended');
+  // Anything past the guarantee comes from a pool shared with every other
+  // installed extension, and updateEnabledRulesets() is atomic: one rejection
+  // costs all blocking at once, for a reason that depends on what else the user
+  // happens to have installed. Staying under it makes that outcome impossible.
   assert.ok(
-    readJson(core.path).length <= GUARANTEED_STATIC_RULES,
-    `core must stay within the ${GUARANTEED_STATIC_RULES} rules Chrome guarantees, so ` +
-    'enabling it can never be rejected for quota'
+    total <= GUARANTEED_STATIC_RULES,
+    `${total} rules exceed the ${GUARANTEED_STATIC_RULES} Chrome guarantees per extension`
   );
 });
 
@@ -174,8 +177,10 @@ test('an exception rule can lift every block rule that could apply', () => {
 
   for (const ruleset of manifest.declarative_net_request.rule_resources) {
     for (const rule of readJson(ruleset.path)) {
-      // The whitelist guard is a different mechanism and covers hosts, not URLs.
-      if (rule.condition.requestDomains) {
+      // The whitelist guard is a different mechanism: it covers hosts outright
+      // rather than opposing a URL pattern. Merged block rules also match by
+      // host, but they still have to be liftable by an exception.
+      if (rule.condition.requestDomains && rule.action.type === 'allow') {
         continue;
       }
       const target = rule.action.type === 'allow' ? allowed : blockable;
@@ -194,18 +199,19 @@ test('an exception rule can lift every block rule that could apply', () => {
   assert.deepEqual(uncovered, [], `no exception rule covers ${uncovered}`);
 });
 
-test('every exception rule lives in the core ruleset', () => {
+test('exceptions lead the ruleset, ahead of every block rule', () => {
   const manifest = readJson('manifest.json');
-  const [core, extended] = manifest.declarative_net_request.rule_resources;
+  const [core] = manifest.declarative_net_request.rule_resources;
+  const rules = readJson(core.path).slice(1); // the whitelist guard leads
 
-  const coreAllows = readJson(core.path).filter(rule => rule.action.type === 'allow');
-  const extendedAllows = readJson(extended.path).filter(rule => rule.action.type === 'allow');
+  const lastAllow = rules.findLastIndex(rule => rule.action.type === 'allow');
+  const firstRedirect = rules.findIndex(rule => rule.action.type === 'redirect');
 
-  assert.ok(coreAllows.length > 0, 'expected exception rules');
-  assert.deepEqual(
-    extendedAllows,
-    [],
-    'an exception stranded in the droppable ruleset would let core block rules fire unopposed'
+  assert.ok(lastAllow >= 0, 'expected exception rules');
+  assert.ok(
+    lastAllow < firstRedirect,
+    'a block rule ahead of the exceptions would be the one to survive a truncation, ' +
+    'leaving it to fire unopposed'
   );
 });
 
@@ -244,23 +250,28 @@ function assertValidRuleset(rules, label, webAccessible) {
     const condition = rule.condition;
     assert.ok(condition, `missing condition ${rule.id}`);
 
-    // The whitelist guard matches by requested host rather than by URL pattern.
+    // The whitelist guard and the merged domain blocks both match by requested
+    // host rather than by URL pattern, so they carry neither filter. Chrome
+    // takes a bare lowercase domain here and rejects the whole ruleset over one
+    // malformed entry, which would cost all blocking at once.
     if (condition.requestDomains) {
-      assert.equal(rule.action.type, 'allow', `rule ${rule.id} must not redirect a whitelisted host`);
-      assert.equal(condition.urlFilter, undefined);
-      assert.equal(condition.regexFilter, undefined);
-      continue;
+      assert.equal(condition.urlFilter, undefined, `rule ${rule.id} mixes host and URL matching`);
+      assert.equal(condition.regexFilter, undefined, `rule ${rule.id} mixes host and URL matching`);
+      for (const domain of condition.requestDomains) {
+        assert.match(domain, HOSTNAME, `rule ${rule.id} has an unusable requestDomain ${domain}`);
+      }
+    } else {
+      assert.equal(
+        Boolean(condition.urlFilter) && Boolean(condition.regexFilter),
+        false,
+        `rule ${rule.id} must not set both urlFilter and regexFilter`
+      );
+      assert.ok(
+        condition.urlFilter || condition.regexFilter,
+        `rule ${rule.id} needs urlFilter or regexFilter`
+      );
     }
 
-    assert.equal(
-      Boolean(condition.urlFilter) && Boolean(condition.regexFilter),
-      false,
-      `rule ${rule.id} must not set both urlFilter and regexFilter`
-    );
-    assert.ok(
-      condition.urlFilter || condition.regexFilter,
-      `rule ${rule.id} needs urlFilter or regexFilter`
-    );
     assert.equal(
       condition.resourceTypes.includes('main_frame'),
       false,

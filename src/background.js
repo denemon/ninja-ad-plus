@@ -1,12 +1,10 @@
 'use strict';
 
-// The core ruleset stays inside Chrome's per-extension static rule guarantee,
-// so enabling it can never be rejected for quota. The extended ruleset exceeds
-// the guarantee and competes with other installed extensions for the shared
-// global pool, so it is enabled on a best-effort basis: losing it costs
-// blocking coverage, never the exceptions that keep sites working.
+// The whole ruleset stays inside Chrome's per-extension static rule guarantee,
+// so enabling it can never be rejected for quota no matter what else the user
+// has installed.
 //
-// Both are declared "enabled": false in the manifest and switched on from here.
+// It is declared "enabled": false in the manifest and switched on from here.
 // Chrome persists the enabled set across sessions but not across extension
 // updates -- "the rule_resources manifest key will determine the set of enabled
 // static rulesets on each extension update" -- so a ruleset marked enabled there
@@ -14,7 +12,6 @@
 // off means an update can only ever under-block for the moment before this
 // worker runs, never block behind a stored OFF.
 const CORE_RULESET_ID = 'core';
-const EXTENDED_RULESET_ID = 'extended';
 const STORAGE_KEY = 'isEnabled';
 
 // spoofing.js runs in the page's MAIN world, where chrome.* APIs are not
@@ -110,27 +107,9 @@ async function applyRuleState(shouldEnable) {
   const badge = shouldEnable ? BADGE.on : BADGE.off;
 
   await updateRuleset(CORE_RULESET_ID, shouldEnable);
-  await applyExtendedRuleset(shouldEnable);
   await applySpoofingState(shouldEnable);
   await chrome.action.setBadgeText({ text: badge.text });
   await chrome.action.setBadgeBackgroundColor({ color: badge.color });
-}
-
-async function applyExtendedRuleset(shouldEnable) {
-  // Disabling never competes for the shared rule pool, so a rejection there is
-  // a real failure: swallowing it would leave 28k rules live while the stored
-  // state says OFF. Only quota pressure while *enabling* is tolerable, and it
-  // costs blocking coverage rather than the OFF guarantee.
-  if (!shouldEnable) {
-    await updateRuleset(EXTENDED_RULESET_ID, false);
-    return;
-  }
-
-  try {
-    await updateRuleset(EXTENDED_RULESET_ID, true);
-  } catch (error) {
-    console.warn('Extended ruleset unavailable, running on core rules only:', error);
-  }
 }
 
 function updateRuleset(rulesetId, shouldEnable) {

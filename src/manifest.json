@@ -36,11 +36,6 @@
         "id": "core",
         "enabled": false,
         "path": "rules-core.json"
-      },
-      {
-        "id": "extended",
-        "enabled": false,
-        "path": "rules-extended.json"
       }
     ]
   },

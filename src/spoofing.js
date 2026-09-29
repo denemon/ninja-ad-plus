@@ -20,6 +20,288 @@
   const returnTrue = () => true;
   const returnFalse = () => false;
 
+  // YouTube serves ads in the same first-party player responses and media
+  // streams as the requested video. Blocking those URLs also blocks playback,
+  // so remove only the ad metadata before the player consumes the response.
+  const isYouTube = (() => {
+    const hostname = window.location && window.location.hostname;
+    return hostname === 'youtube.com' || (hostname || '').endsWith('.youtube.com');
+  })();
+
+  // YouTube's raw Network Machine path consumes binary/streamed responses and
+  // bypasses the JSON response hooks below. Trap the config assignments made by
+  // the boot scripts and keep that path disabled even if an experiment update
+  // tries to turn it back on later.
+  const watchProperty = (target, property, onValue) => {
+    if (!target || typeof target !== 'object') return;
+    const descriptor = Object.getOwnPropertyDescriptor(target, property);
+    if (descriptor && !descriptor.configurable) {
+      onValue(target[property]);
+      return;
+    }
+
+    let value = target[property];
+    Object.defineProperty(target, property, {
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get() { return value; },
+      set(nextValue) {
+        value = nextValue;
+        onValue(nextValue);
+      },
+    });
+    onValue(value);
+  };
+
+  const forceYouTubeJsonNetworking = (flags) => {
+    if (!flags || typeof flags !== 'object') return;
+    for (const property of [
+      'all_web_enable_network_machine',
+      'all_web_network_machine_raw_request',
+    ]) {
+      const descriptor = Object.getOwnPropertyDescriptor(flags, property);
+      if (descriptor && !descriptor.configurable) {
+        try { flags[property] = false; } catch (_) {}
+        continue;
+      }
+      Object.defineProperty(flags, property, {
+        configurable: true,
+        enumerable: descriptor?.enumerable ?? true,
+        get: returnFalse,
+        set: noopFn,
+      });
+    }
+  };
+
+  if (isYouTube) {
+    watchProperty(window, 'ytcfg', (config) => {
+      watchProperty(config, 'data_', (data) => {
+        watchProperty(data, 'EXPERIMENT_FLAGS', forceYouTubeJsonNetworking);
+      });
+    });
+  }
+
+  // Carriers of ad metadata that sit alongside real content under the same
+  // parent, so the key can simply be dropped.
+  const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams'];
+
+  // A Polymer element name maps 1:1 from its renderer key -- adSlotRenderer
+  // becomes <ytd-ad-slot-renderer> -- so this list is the JSON-side twin of the
+  // selectors in youtube.js. The DOM pass stays as a backstop for what never
+  // reaches this code: player chrome (.ytp-*) is built by the player itself and
+  // has no renderer key, and a response read as a stream or an ArrayBuffer is
+  // not pruned at all.
+  const AD_RENDERER_KEYS = new Set([
+    'actionCompanionAdRenderer',
+    'adSlotRenderer',
+    'bannerPromoRenderer',
+    'compactPromotedVideoRenderer',
+    'companionAdRenderer',
+    'companionSlotRenderer',
+    'displayAdRenderer',
+    'inFeedAdLayoutRenderer',
+    'merchandiseShelfRenderer',
+    'playerLegacyDesktopWatchAdsRenderer',
+    'promotedSparklesTextRenderer',
+    'promotedSparklesWebRenderer',
+    'promotedVideoRenderer',
+    'searchPyvRenderer',
+    'statementBannerRenderer',
+  ]);
+
+  // Deleting the renderer key on its own leaves the wrappers around it, which
+  // render as an empty card, so the whole entry carrying one is dropped. The
+  // renderer sits a couple of wrappers down at most
+  // (richItemRenderer.content.adSlotRenderer), and the depth bound doubles as
+  // the cycle guard.
+  //
+  // Only a single-key chain is followed. A search section holds real videos and
+  // a searchPyvRenderer in one contents array, so "contains an ad somewhere
+  // below" would splice the whole section and take the results with it. An
+  // entry that holds anything besides the ad is a container, and the ads inside
+  // it get spliced from their own array by the walk below.
+  const isYouTubeAdEntry = (entry, depth = 4) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) || depth < 0) return false;
+    if (entry.command?.reelWatchEndpoint?.adClientParams?.isAd) return true;
+
+    const keys = Object.keys(entry);
+    if (keys.some((key) => AD_RENDERER_KEYS.has(key))) return true;
+    return keys.length === 1 && isYouTubeAdEntry(entry[keys[0]], depth - 1);
+  };
+
+  const pruneYouTubeAdData = (value, seen = new WeakSet()) => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return value;
+    seen.add(value);
+
+    for (const key of AD_KEYS) {
+      delete value[key];
+    }
+
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0; index--) {
+        if (isYouTubeAdEntry(value[index])) {
+          value.splice(index, 1);
+          continue;
+        }
+        pruneYouTubeAdData(value[index], seen);
+      }
+      return value;
+    }
+
+    for (const child of Object.values(value)) {
+      pruneYouTubeAdData(child, seen);
+    }
+    return value;
+  };
+
+  // Some clients fetch the same InnerTube responses from the API host instead
+  // of the site host, and those arrive unpruned if only *.youtube.com counts.
+  const YOUTUBE_API_HOST = 'youtubei.googleapis.com';
+
+  // Ad payloads ride along with the feed, search, related-video, guide and
+  // Shorts responses, not just the player response. Matching only the player
+  // paths leaves every other surface to be cleaned out of the DOM after it has
+  // already rendered -- which is the flash of ad content the DOM pass chases.
+  const AD_BEARING_PATH =
+    /^\/(?:watch|playlist|get_watch)$|^\/youtubei\/v1\/(?:player|get_watch|next|browse|search|guide|reel)(?:$|\/)/;
+
+  const isYouTubePlayerResponse = (url) => {
+    if (!isYouTube || !url || !window.URL) return false;
+    try {
+      const parsed = new window.URL(String(url), window.location.href);
+      const hostname = parsed.hostname;
+      if (
+        hostname !== 'youtube.com' &&
+        !hostname.endsWith('.youtube.com') &&
+        hostname !== YOUTUBE_API_HOST
+      ) return false;
+      return AD_BEARING_PATH.test(parsed.pathname);
+    } catch (_) {
+      return false;
+    }
+  };
+
+  // Cheap pre-check so ordinary responses skip the parse/stringify round trip.
+  // Built from the lists above rather than hand-written, so a key added there
+  // cannot be missed here and silently stop reaching the walk. adClientParams
+  // is the Shorts marker -- those entries carry no other ad key.
+  // ponytail: parse+stringify walks the whole response; only reached when an
+  // ad key is actually present. Move to a streaming prune if feeds get slow.
+  const AD_TEXT_MARKER = new RegExp(
+    `"(?:${[...AD_KEYS, 'adClientParams', ...AD_RENDERER_KEYS].join('|')})"`
+  );
+
+  const pruneYouTubeJsonText = (text) => {
+    if (typeof text !== 'string' || !AD_TEXT_MARKER.test(text)) {
+      return text;
+    }
+
+    const newline = text.indexOf('\n');
+    const hasXssiPrefix = text.startsWith(")]}'") && newline >= 0;
+    const prefix = hasXssiPrefix ? text.slice(0, newline + 1) : '';
+    try {
+      return prefix + JSON.stringify(pruneYouTubeAdData(JSON.parse(text.slice(prefix.length))));
+    } catch (_) {
+      return text;
+    }
+  };
+
+  const installYouTubePlayerGuards = () => {
+    if (!isYouTube) return;
+
+    for (const name of ['ytInitialPlayerResponse', 'ytInitialData']) {
+      if (Object.prototype.hasOwnProperty.call(window, name)) {
+        pruneYouTubeAdData(window[name]);
+        continue;
+      }
+
+      let value;
+      Object.defineProperty(window, name, {
+        configurable: true,
+        enumerable: true,
+        get() { return value; },
+        set(nextValue) { value = pruneYouTubeAdData(nextValue); },
+      });
+    }
+
+    const responsePrototype = window.Response && window.Response.prototype;
+    for (const [method, prune] of [
+      ['json', pruneYouTubeAdData],
+      ['text', pruneYouTubeJsonText],
+    ]) {
+      const original = responsePrototype && responsePrototype[method];
+      if (typeof original !== 'function') continue;
+      responsePrototype[method] = new Proxy(original, {
+        apply(target, response, args) {
+          const result = Reflect.apply(target, response, args);
+          return isYouTubePlayerResponse(response.url)
+            ? Promise.resolve(result).then(prune)
+            : result;
+        },
+      });
+    }
+
+    const xhrPrototype = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (!xhrPrototype || typeof xhrPrototype.open !== 'function') return;
+
+    const requestUrls = new WeakMap();
+    const originalOpen = xhrPrototype.open;
+    xhrPrototype.open = new Proxy(originalOpen, {
+      apply(target, request, args) {
+        requestUrls.set(request, args[1]);
+        return Reflect.apply(target, request, args);
+      },
+    });
+
+    for (const property of ['response', 'responseText']) {
+      const descriptor = Object.getOwnPropertyDescriptor(xhrPrototype, property);
+      if (!descriptor?.get || !descriptor.configurable) continue;
+      Object.defineProperty(xhrPrototype, property, {
+        ...descriptor,
+        get() {
+          const value = descriptor.get.call(this);
+          if (!isYouTubePlayerResponse(requestUrls.get(this))) return value;
+          if (typeof value === 'string') return pruneYouTubeJsonText(value);
+          return this.responseType === 'json' ? pruneYouTubeAdData(value) : value;
+        },
+      });
+    }
+  };
+
+  installYouTubePlayerGuards();
+
+  let youtubeAdCheckScheduled = false;
+  const checkYouTubeServerSideAd = () => {
+    youtubeAdCheckScheduled = false;
+    if (!isYouTube) return;
+
+    const player = document.getElementById('movie_player');
+    try {
+      const debugInfo = player?.getStatsForNerds?.()?.debug_info;
+      if (typeof debugInfo !== 'string' || !debugInfo.startsWith('SSAP, AD')) return;
+
+      player.querySelector(
+        '.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button'
+      )?.click();
+      const duration = player.getProgressState?.()?.duration;
+      if (Number.isFinite(duration) && duration > 0) {
+        player.seekTo?.(duration);
+      }
+    } catch (_) {}
+  };
+
+  const scheduleYouTubeAdCheck = () => {
+    if (!isYouTube || youtubeAdCheckScheduled) return;
+    youtubeAdCheckScheduled = true;
+    const schedule = window.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
+    schedule(checkYouTubeServerSideAd);
+  };
+
+  if (isYouTube) {
+    document.addEventListener('timeupdate', scheduleYouTubeAdCheck, true);
+    document.addEventListener('yt-navigate-finish', scheduleYouTubeAdCheck);
+  }
+
   // =========================================================================
   // 1. Google Publisher Tag (googletag)
   // =========================================================================
@@ -384,8 +666,13 @@
   // 7. MutationObserver — protect bait elements + hide broken ad templates
   // =========================================================================
 
+  // Detection bait is an empty placeholder the site measures. Real UI that
+  // happens to carry a bait word -- GitHub/Primer names its message box
+  // "Banner-message" -- holds text, and force-showing it with !important leaks
+  // every message the site deliberately hides. Only unhide what is empty.
   const protectBaitElement = (el) => {
     if (!isBaitElement(el)) return;
+    if ((el.textContent || '').trim() !== '') return;
     const style = window.getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
       el.style.setProperty('display', 'block', 'important');
@@ -525,6 +812,7 @@
         hideBrokenSponsoredTemplate(mutation.target);
       }
     }
+    scheduleYouTubeAdCheck();
   });
 
   const startObserving = () => {
@@ -544,6 +832,7 @@
   } else {
     document.addEventListener('DOMContentLoaded', startObserving, { once: true });
   }
+  scheduleYouTubeAdCheck();
 
   // =========================================================================
   // 8. One-shot anti-adblock overlay removal (runs once after initial load)

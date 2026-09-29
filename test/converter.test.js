@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { convertLines, parseLine, splitRules } = require('../convert');
+const { convertLines, parseLine, assertFitsGuarantee } = require('../convert');
 
 // Every ruleset leads with the whitelist guard rule. These tests are about the
 // rules converted from the input lines, so drop it — while asserting it is
@@ -113,10 +113,9 @@ test('a filter for a type no noop can serve is dropped, not redirected elsewhere
 });
 
 test('rules are emitted noop group by noop group, not filter by filter', () => {
-  // splitRules cuts the core ruleset off at a fixed rule count, so the order
-  // decides what survives when the extended ruleset cannot be enabled. Grouping
-  // by target puts one rule per filter in front, rather than every variant of
-  // the first quarter of the filters.
+  // The order decides what a ruleset that overflowed the guarantee would drop
+  // first. Grouping by target puts one rule per filter in front, rather than
+  // every variant of the first quarter of the filters.
   const result = convert(['||a.example/ad^', '||b.example/ad^']);
 
   assert.deepEqual(
@@ -160,17 +159,66 @@ test('whitelisting matches whole hosts, not substrings', () => {
   );
 });
 
-test('splitRules keeps every exception in the core ruleset', () => {
-  const rules = [
-    { id: 1, action: { type: 'allow' } },
-    { id: 2, action: { type: 'redirect' } },
-  ];
+test('assertFitsGuarantee refuses a ruleset that would need the shared pool', () => {
+  const oversized = Array.from({ length: 30001 }, (_, index) => ({ id: index + 1 }));
 
-  const { core, extended } = splitRules(rules);
+  assert.throws(() => assertFitsGuarantee(oversized), /30001 rules exceed/);
+  assert.doesNotThrow(() => assertFitsGuarantee(oversized.slice(0, 30000)));
+});
 
-  assert.equal(core.length, 2);
-  assert.deepEqual(extended, []);
-  assert.equal(core.filter(rule => rule.action.type === 'allow').length, 1);
+// Whole-host filters are what the bundled lists are almost entirely made of, so
+// this merge is the difference between ~12,000 rules and ~178,000. At the old
+// count everything past Chrome's guarantee competed for the shared global pool,
+// and the networks that fell past the cut -- g.doubleclick.net among them --
+// were blocked only if that gamble paid off.
+test('whole-host filters merge into one requestDomains rule per noop target', () => {
+  const result = convert(['||a.example^', '||b.example^', '||c.example^']);
+  const merged = result.rules.filter(rule => rule.condition.requestDomains);
+
+  assert.deepEqual(
+    merged.map(rule => rule.action.redirect.extensionPath),
+    ['/noop.js', '/noop.gif', '/noop.html']
+  );
+  for (const rule of merged) {
+    assert.deepEqual(rule.condition.requestDomains, ['a.example', 'b.example', 'c.example']);
+    assert.equal(rule.condition.urlFilter, undefined);
+  }
+});
+
+test('merging keeps filters apart when their conditions differ', () => {
+  const result = convert([
+    '||a.example^',
+    '||b.example^$third-party',        // domainType cannot vary within one rule
+    '||c.example^$script',             // narrower resourceTypes must not widen
+    '||d.example^$domain=publisher.example', // initiatorDomains is per-filter
+  ]);
+
+  const byDomains = result.rules
+    .filter(rule => rule.condition.requestDomains)
+    .filter(rule => rule.action.redirect.extensionPath === '/noop.js')
+    .map(rule => [rule.condition.requestDomains, rule.condition.domainType, rule.condition.resourceTypes]);
+
+  assert.deepEqual(byDomains, [
+    [['a.example'], undefined, ['script', 'xmlhttprequest', 'ping', 'other', 'object']],
+    [['b.example'], 'thirdParty', ['script', 'xmlhttprequest', 'ping', 'other', 'object']],
+    [['c.example'], undefined, ['script']],
+  ]);
+  assert.ok(
+    result.rules.some(rule => rule.condition.urlFilter === '||d.example^'),
+    'a $domain= filter must keep its own rule so its initiatorDomains stay its own'
+  );
+});
+
+// ||ad.example without a trailing ^ also matches ad.example.evil.net, which
+// requestDomains would not: merging it would silently narrow the filter.
+test('only a bare host with a trailing separator is safe to merge', () => {
+  const result = convert(['||ad.example', '||ad.example:8080^', '||ads.*.example^']);
+
+  assert.deepEqual(result.rules.filter(rule => rule.condition.requestDomains), []);
+  assert.deepEqual(
+    [...new Set(result.rules.map(rule => rule.condition.urlFilter))],
+    ['||ad.example', '||ad.example:8080^', '||ads.*.example^']
+  );
 });
 
 test('converts EasyList regex rules to DNR regexFilter rules', () => {
@@ -198,6 +246,16 @@ test('keeps slash-wrapped path filters as urlFilter rules', () => {
   const result = convert(['/ads/$script']);
   assert.equal(result.rules.length, 1);
   assert.equal(result.rules[0].condition.urlFilter, '/ads/');
+});
+
+test('skips regex rules whose compiled form exceeds the RE2 2KB limit', () => {
+  // 33 written characters, but RE2 expands .{100,} at compile time and blows
+  // Chrome's 2KB program-memory cap — the rule would load as an error and be
+  // skipped by Chrome anyway.
+  const result = convert(['/(https?:\\/\\/)104\\.154\\..{100,}/$script,third-party']);
+
+  assert.equal(result.rules.length, 0);
+  assert.equal(result.skipped.invalid, 1);
 });
 
 test('skips popup-only and regex popup rules', () => {

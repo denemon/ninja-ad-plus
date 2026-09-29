@@ -10,12 +10,28 @@
   ].join(',');
   const AD_ELEMENTS = [
     '#masthead-ad',
+    '#player-ads',
+    '#shopping-timely-shelf',
     '.ytp-ad-overlay-container',
+    '.ytp-suggested-action-badge',
+    'ad-slot-renderer',
     'ytd-ad-slot-renderer',
+    'ytd-action-companion-ad-renderer',
+    'ytd-companion-slot-renderer',
     'ytd-display-ad-renderer',
     'ytd-in-feed-ad-layout-renderer',
+    'ytd-merch-shelf-renderer',
+    'ytd-player-legacy-desktop-watch-ads-renderer',
     'ytd-promoted-sparkles-web-renderer',
     'ytd-promoted-video-renderer',
+    'ytd-search-pyv-renderer',
+    'ytm-companion-ad-renderer',
+  ].join(',');
+  const AD_CONTAINERS = [
+    '.ytd-shorts',
+    'ytd-rich-item-renderer',
+    'ytm-companion-slot',
+    'ytm-rich-item-renderer',
   ].join(',');
 
   let enabled = false;
@@ -31,7 +47,7 @@
   }
 
   function skipVideoAd() {
-    const player = document.querySelector('#movie_player.ad-showing');
+    const player = document.querySelector('#movie_player.ad-showing, #movie_player.ad-interrupting');
     if (!player) {
       restorePlaybackRate();
       return;
@@ -57,7 +73,7 @@
 
   function removeAdElements() {
     for (const element of document.querySelectorAll(AD_ELEMENTS)) {
-      element.remove();
+      (element.closest?.(AD_CONTAINERS) || element).remove();
     }
   }
 
