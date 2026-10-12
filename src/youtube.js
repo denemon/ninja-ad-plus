@@ -9,8 +9,8 @@
     '.videoAdUiSkipButton',
   ].join(',');
 
-  // Compatibility mode: let YouTube load and play ads normally. Only use the
-  // native skip control once it is available; never seek or alter player data.
+  // Fallback for ads that reach the player: use the native skip control once
+  // available. Initial player-response filtering runs in youtube-player.js.
   let enabled = false;
   let storageChanged = false;
   let observer;

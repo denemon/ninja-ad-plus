@@ -52,6 +52,7 @@ test('src/ holds only files the packaged extension needs', () => {
     ...manifest.web_accessible_resources.flatMap(entry => entry.resources),
     ...popupAssets(manifest.action.default_popup),
     'spoofing.js', // registered at runtime by background.js, not in the manifest
+    'youtube-player.js', // YouTube-only MAIN-world filter under the same switch
   ]);
 
   const unexpected = fs.readdirSync(ROOT)
@@ -61,7 +62,7 @@ test('src/ holds only files the packaged extension needs', () => {
   assert.deepEqual(unexpected, [], `src/ should not ship unreferenced files: ${unexpected}`);
 });
 
-test('spoofing.js is registered dynamically so the toggle can disable it', () => {
+test('page-context scripts are registered dynamically so the toggle can disable them', () => {
   const manifest = readJson('manifest.json');
   const manifestScripts = manifest.content_scripts.flatMap(script => script.js);
 
@@ -72,6 +73,8 @@ test('spoofing.js is registered dynamically so the toggle can disable it', () =>
   );
   assert.ok(manifest.permissions.includes('scripting'), 'dynamic registration needs "scripting"');
   assert.ok(fs.existsSync(path.join(ROOT, 'spoofing.js')));
+  assert.equal(manifestScripts.includes('youtube-player.js'), false);
+  assert.ok(fs.existsSync(path.join(ROOT, 'youtube-player.js')));
 });
 
 test('every static rule fits inside Chrome\'s guarantee', () => {

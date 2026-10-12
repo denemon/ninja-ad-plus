@@ -1,7 +1,7 @@
 {
   "name": "Ninja Ad (Stealth Switch)",
-  "description": "Ad blocker with YouTube compatibility: automatically clicks available skip buttons.",
-  "version": "11.4",
+  "description": "Ad blocker with YouTube player-ad filtering and automatic native skipping.",
+  "version": "11.5",
   "manifest_version": 3,
   "minimum_chrome_version": "102",
   "permissions": [

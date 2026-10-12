@@ -8,7 +8,7 @@ const vm = require('node:vm');
 
 const BACKGROUND_SOURCE = fs.readFileSync(path.resolve(__dirname, '..', 'src', 'background.js'), 'utf8');
 
-function createBackgroundContext({ spoofingRegistered = false } = {}) {
+function createBackgroundContext({ spoofingRegistered = false, youtubePlayerRegistered = false } = {}) {
   const listeners = {};
   const storage = {};
   const updates = [];
@@ -19,10 +19,14 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
   const badge = {};
   let dnrFailure = null;
   let scriptingFailure = null;
+  let scriptingFailureId;
   let scriptQueryGate = null;
 
   if (spoofingRegistered) {
     registeredScripts.set('spoofing', { id: 'spoofing' });
+  }
+  if (youtubePlayerRegistered) {
+    registeredScripts.set('youtube-player', { id: 'youtube-player' });
   }
 
   const chrome = {
@@ -72,7 +76,7 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
         return ids.filter(id => registeredScripts.has(id)).map(id => registeredScripts.get(id));
       },
       async registerContentScripts(scripts) {
-        if (scriptingFailure) {
+        if (scriptingFailure && (!scriptingFailureId || scripts.some(script => script.id === scriptingFailureId))) {
           throw scriptingFailure;
         }
         for (const script of scripts) {
@@ -81,7 +85,7 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
         }
       },
       async updateContentScripts(scripts) {
-        if (scriptingFailure) throw scriptingFailure;
+        if (scriptingFailure && (!scriptingFailureId || scripts.some(script => script.id === scriptingFailureId))) throw scriptingFailure;
         for (const script of scripts) {
           assert.ok(registeredScripts.has(script.id));
           scriptUpdates.push(script);
@@ -129,8 +133,9 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
     failRuleset(rulesetId, message) {
       rulesetFailures.set(rulesetId, new Error(message));
     },
-    failScripting(message) {
+    failScripting(message, scriptId) {
       scriptingFailure = new Error(message);
+      scriptingFailureId = scriptId;
     },
   };
 }
@@ -172,6 +177,7 @@ test('a slow startup sync cannot re-enable anything after a later OFF toggle', a
   assert.equal(response.status, 'success');
   assert.equal(storage.isEnabled, false);
   assert.equal(registeredScripts.has('spoofing'), false, 'spoofing must not come back');
+  assert.equal(registeredScripts.size, 0, 'the player filter must not come back either');
   assert.deepEqual([...enabledRulesets], [], 'no ruleset may survive the OFF toggle');
   assert.equal(badge.text, 'OFF');
 });
@@ -208,12 +214,12 @@ test('a partial failure re-derives every component from the stored state', async
   );
 });
 
-test('turning the extension off unregisters the page-context spoofing script', async () => {
-  const { listeners, registeredScripts } = createBackgroundContext({ spoofingRegistered: true });
+test('turning the extension off unregisters both page-context scripts', async () => {
+  const { listeners, registeredScripts } = createBackgroundContext({ spoofingRegistered: true, youtubePlayerRegistered: true });
 
   await sendToggle(listeners, false);
 
-  assert.equal(registeredScripts.has('spoofing'), false);
+  assert.equal(registeredScripts.size, 0);
 });
 
 test('turning the extension on registers spoofing in the MAIN world at document_start', async () => {
@@ -237,7 +243,7 @@ test('installation sync migrates a persisted spoofing registration to exclude Yo
 
   await listeners.installed();
 
-  assert.equal(registeredScripts.size, 1);
+  assert.equal(registeredScripts.size, 2);
   assert.equal(scriptUpdates.length, 1);
   assert.deepEqual(Array.from(registeredScripts.get('spoofing').excludeMatches), [
     '*://*.youtube.com/*', '*://*.youtube-nocookie.com/*',
@@ -251,6 +257,31 @@ test('startup sync registers spoofing for a first-run install', async () => {
 
   assert.equal(storage.isEnabled, true);
   assert.ok(registeredScripts.has('spoofing'));
+  assert.ok(registeredScripts.has('youtube-player'));
+});
+
+test('the player filter is registered before page scripts on YouTube and embedded players', async () => {
+  const { listeners, registeredScripts } = createBackgroundContext();
+  await sendToggle(listeners, true);
+  const script = registeredScripts.get('youtube-player');
+  assert.ok(script);
+  assert.deepEqual(Array.from(script.js), ['youtube-player.js']);
+  assert.deepEqual(Array.from(script.matches), ['*://*.youtube.com/*', '*://*.youtube-nocookie.com/*']);
+  assert.equal(script.world, 'MAIN');
+  assert.equal(script.runAt, 'document_start');
+  assert.equal(script.allFrames, true);
+  assert.equal(script.persistAcrossSessions, true);
+});
+
+test('a failed player-filter registration rolls back the already registered generic script', async () => {
+  const { listeners, storage, registeredScripts, enabledRulesets, failScripting } = createBackgroundContext();
+  storage.isEnabled = false;
+  failScripting('player filter registration failed', 'youtube-player');
+  const result = await sendToggle(listeners, true);
+  assert.equal(result.status, 'error');
+  assert.equal(storage.isEnabled, false);
+  assert.equal(registeredScripts.size, 0);
+  assert.equal(enabledRulesets.size, 0);
 });
 
 test('toggle message reports DNR failures without persisting the new state', async () => {

@@ -133,7 +133,7 @@ function runSpoofing(context) {
   vm.runInNewContext(SPOOFING_SOURCE, context, { filename: 'spoofing.js' });
 }
 
-test('YouTube and privacy-enhanced embeds receive no page-context patches or observers', () => {
+test('generic spoofing leaves YouTube and privacy-enhanced embeds untouched', () => {
   for (const hostname of ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtube-nocookie.com', 'www.youtube-nocookie.com']) {
     const { context, listeners, observers, timers } = createSpoofingContext();
     context.window.location = { hostname, href: `https://${hostname}/` };

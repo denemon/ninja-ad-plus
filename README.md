@@ -4,8 +4,8 @@
 
 Chrome Manifest V3 ad-blocking extension. On general sites, it redirects matching
 ad resources to local noop files instead of hard-blocking them. Successful loads
-do not guarantee that blocking is undetectable. YouTube uses the compatibility
-behavior below: normal ad playback with automatic use of available skip buttons.
+do not guarantee that blocking is undetectable. YouTube filters player-ad data
+before player initialization, with native auto-skip as a fallback.
 
 ## How It Works
 
@@ -58,15 +58,29 @@ An exception narrower than the block it opposes silently fails to except —
 the exception exists to permit, because a priority-2 `allow` cannot override a
 type it does not claim.
 
-All blocking runs in Chrome's native C++ `declarativeNetRequest` engine. No JavaScript executes per network request.
+General-site redirects run in Chrome's native `declarativeNetRequest` engine.
+The YouTube player-response filter below runs separately in page JavaScript.
 
-### YouTube Compatibility
+### YouTube Player-Ad Filtering
 
-When ON, `youtube.js` clicks only visible, enabled native skip buttons during an
-ad. **Ads play until skipping is available; unskippable ads and page ad slots remain.**
-There is no seeking, speed change, ad-data pruning, networking-flag override, or
-ad-element removal. The same behavior applies to YouTube embeds, including
-`youtube-nocookie.com`.
+When ON, `youtube-player.js` runs in MAIN at `document_start`, before the initial
+player consumes `ytInitialPlayerResponse`. It removes `adPlacements` and `adSlots`
+from that object synchronously, including later assignments. It also filters
+these keys in known player API fetch/XHR responses. Fetch filtering replaces the
+response body, so `json()`, `text()`, `arrayBuffer()`, and stream consumers see the
+filtered data. Valid JSON text retains its serialization and optional anti-XSSI
+prefix; ad keys are renamed to the unused `no_ads` key. Playback tracking,
+heartbeat data, media URLs, and networking configuration are preserved.
+
+Only known player endpoints on YouTube and `youtubei.googleapis.com` are targeted.
+Fetch responses are buffered through a clone; malformed, non-JSON, ad-free, and
+failed responses pass through. This does not remove ads already inserted into
+the media stream or handle every alternate networking path/response format.
+
+For ads that still reach the player, `youtube.js` clicks visible, enabled native
+skip buttons. **Fallback ads play until skipping becomes available, and page ad
+slots remain.** There is no forced seeking or speed change. The same behavior
+applies to YouTube embeds, including `youtube-nocookie.com`.
 
 Two guards bypass this extension's network filtering for YouTube:
 priority-4 `allowAllRequests` protects YouTube frame trees (including third-party frames),
@@ -78,22 +92,23 @@ hostname guard inside the script as well. Persisted registrations are refreshed
 on installation, updates, startup, and enabling the extension.
 
 **After updating, reload the extension in `chrome://extensions/`, then close and
-reopen YouTube tabs (and pages containing embeds).** Existing pages retain the
-old injected patches until reloaded. If a warning persists, compare with other
-blockers disabled. This mode reduces interference; it does not guarantee that
-YouTube will never detect automated skipping.
+reopen YouTube tabs (and pages containing embeds). Also reopen pages after changing
+ON/OFF to apply or remove the MAIN-world filter.** Existing pages retain injected
+hooks until reloaded. Actual pre-roll suppression and anti-adblock warnings must
+be checked on the affected account; local tests do not guarantee undetectability.
+If a warning persists, turn OFF and reopen the page to compare.
 
 Every component honours the single ON/OFF switch, but by two different
 mechanisms. `youtube.js` runs in the isolated world and watches
-`chrome.storage` directly. `spoofing.js` runs in the page's MAIN world, where
-`chrome.*` APIs do not exist, so it cannot read the state itself — the service
-worker registers and unregisters it through `chrome.scripting` instead. Turning
+`chrome.storage` directly. `spoofing.js` and `youtube-player.js` run in MAIN, where
+`chrome.*` APIs do not exist, so they cannot read the state themselves — the service
+worker registers and unregisters them through `chrome.scripting` instead. Turning
 the extension off therefore stops the page-context patching too, from the next
 page load onward.
 
 ### Keeping OFF Meaning OFF
 
-One toggle drives four things — the ruleset, page spoofing, the YouTube skipper and the badge
+One toggle drives the ruleset, page spoofing, YouTube player filtering, native skipping, and the badge
 — so `background.js` treats the stored value as the single source of truth and
 protects it three ways:
 
@@ -302,9 +317,10 @@ input or a test, so nothing but `src/` is ever loaded into Chrome.
 ninja-ad-plus/
 ├── src/                        # ← Load unpacked target: the packaged extension
 │   ├── manifest.json           # MV3 config (permissions, ruleset, service worker)
-│   ├── background.js           # Service worker: ruleset + spoofing toggle, badge, storage sync
+│   ├── background.js           # Service worker: ruleset + MAIN script toggles, badge, storage sync
 │   ├── spoofing.js             # MAIN-world ad/anti-adblock stubs (registered by background.js)
-│   ├── youtube.js              # YouTube compatibility: click available native skip buttons
+│   ├── youtube-player.js       # MAIN-world initial/API player-ad filtering (registered dynamically)
+│   ├── youtube.js              # Fallback: click available native YouTube skip buttons
 │   ├── popup.html              # Popup UI: toggle switch with status indicator
 │   ├── popup.js                # Popup controller: reads/writes state, sends toggle messages
 │   ├── rules-core.json         # Generated: ~12k rules incl. all exceptions, enabled from stored state
@@ -343,7 +359,7 @@ build inputs cannot drift back into the shipped directory unnoticed.
 - **Page-context spoofing is switchable**: Outside YouTube, `spoofing.js` is injected at `document_start` in the page's MAIN world to stub common ad/anti-adblock globals. It is bundled locally, loads no remote code, and is unregistered entirely when the extension is switched off — so a site it breaks can be recovered by toggling off and reloading.
 - **Bait protection is name-exact**: `spoofing.js` force-shows hidden elements whose class or id looks like ad bait, to defeat dimension probing. Each class token must equal a bait word or be a bait word followed by `-`/`_`, so `address`, `admin-dialog` and `adaptive-layout` are left alone. An open-ended prefix match would force ordinary hidden UI visible with `!important` on every site.
 - **No main_frame redirection**: Document-level rules are explicitly excluded to prevent forced navigation.
-- **Minimal permissions**: Only the four permissions below. `scripting` buys the kill switch for the MAIN-world script and is not used for remote or arbitrary code injection — the only script it ever registers is the bundled `spoofing.js`.
+- **Minimal permissions**: Only the four permissions below. `scripting` controls the bundled MAIN-world scripts, `spoofing.js` and `youtube-player.js`. No remote scripts are loaded.
 - **Domain whitelist**: Critical services (Google, YouTube) are protected from accidental blocking at the build step.
 - **web_accessible_resources**: Noop files are exposed to all URLs (required for redirects). These files contain no executable logic or sensitive data.
 
@@ -353,6 +369,6 @@ build inputs cannot drift back into the shipped directory unnoticed.
 |---|---|
 | `declarativeNetRequest` | Register and toggle DNR rulesets |
 | `declarativeNetRequestWithHostAccess` | Apply redirect rules to all URLs |
-| `scripting` | Register/unregister the MAIN-world `spoofing.js` so the ON/OFF switch reaches it |
+| `scripting` | Register/unregister bundled MAIN-world scripts under the ON/OFF switch |
 | `storage` | Persist ON/OFF state across browser restarts |
 | `host_permissions: <all_urls>` | Required for redirect rules to match any URL |
