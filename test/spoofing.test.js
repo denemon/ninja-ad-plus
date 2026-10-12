@@ -133,6 +133,37 @@ function runSpoofing(context) {
   vm.runInNewContext(SPOOFING_SOURCE, context, { filename: 'spoofing.js' });
 }
 
+test('YouTube and privacy-enhanced embeds receive no page-context patches or observers', () => {
+  for (const hostname of ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtube-nocookie.com', 'www.youtube-nocookie.com']) {
+    const { context, listeners, observers, timers } = createSpoofingContext();
+    context.window.location = { hostname, href: `https://${hostname}/` };
+    context.window.ytcfg = { data_: { EXPERIMENT_FLAGS: { all_web_enable_network_machine: true } } };
+    context.window.ytInitialPlayerResponse = { adPlacements: [{ id: 'ad' }], adBreakHeartbeatParams: 'heartbeat' };
+    const windowKeys = Object.keys(context.window);
+    const height = Object.getOwnPropertyDescriptor(context.HTMLElement.prototype, 'offsetHeight');
+    runSpoofing(context);
+    assert.deepEqual(Object.keys(context.window), windowKeys, hostname);
+    assert.deepEqual(context.window.ytInitialPlayerResponse, {
+      adPlacements: [{ id: 'ad' }], adBreakHeartbeatParams: 'heartbeat',
+    });
+    assert.equal(context.window.ytcfg.data_.EXPERIMENT_FLAGS.all_web_enable_network_machine, true);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(context.HTMLElement.prototype, 'offsetHeight'), height);
+    assert.equal(observers.length, 0);
+    assert.equal(timers.length, 0);
+    assert.deepEqual(listeners, {});
+  }
+});
+
+test('YouTube exclusions use host boundaries, preserving spoofing on unrelated sites', () => {
+  for (const hostname of ['notyoutube.com', 'youtube.com.example.org', 'youtube-nocookie.com.example.org']) {
+    const { context, observers } = createSpoofingContext();
+    context.window.location = { hostname };
+    runSpoofing(context);
+    assert.equal(context.window.googletag.apiReady, true, hostname);
+    assert.equal(observers.length, 1);
+  }
+});
+
 test('googletag command queue executes callbacks once', () => {
   const { context } = createSpoofingContext();
 
@@ -162,198 +193,6 @@ test('pre-existing googletag command queue is flushed once and wrapped once', ()
   });
 
   assert.equal(count, 2);
-});
-
-test('forces YouTube off the raw Network Machine response path', () => {
-  const { context } = createSpoofingContext();
-  context.window.location = { hostname: 'www.youtube.com', href: 'https://www.youtube.com/' };
-  context.window.URL = URL;
-
-  runSpoofing(context);
-
-  context.window.ytcfg = {};
-  context.window.ytcfg.data_ = {};
-  context.window.ytcfg.data_.EXPERIMENT_FLAGS = {
-    all_web_enable_network_machine: true,
-    all_web_network_machine_raw_request: true,
-    unrelated_experiment: true,
-  };
-  const flags = context.window.ytcfg.data_.EXPERIMENT_FLAGS;
-
-  assert.equal(flags.all_web_enable_network_machine, false);
-  assert.equal(flags.all_web_network_machine_raw_request, false);
-  assert.equal(flags.unrelated_experiment, true);
-
-  flags.all_web_enable_network_machine = true;
-  flags.all_web_network_machine_raw_request = true;
-  assert.equal(flags.all_web_enable_network_machine, false);
-  assert.equal(flags.all_web_network_machine_raw_request, false);
-
-  context.window.ytcfg = {
-    data_: {
-      EXPERIMENT_FLAGS: {
-        all_web_enable_network_machine: true,
-        all_web_network_machine_raw_request: true,
-      },
-    },
-  };
-  const replacedFlags = context.window.ytcfg.data_.EXPERIMENT_FLAGS;
-  assert.equal(replacedFlags.all_web_enable_network_machine, false);
-  assert.equal(replacedFlags.all_web_network_machine_raw_request, false);
-});
-
-test('removes ad metadata from YouTube initial, fetch and XHR player responses', async () => {
-  class FakeResponse {
-    constructor(url, body) {
-      this.url = url;
-      this.body = body;
-    }
-    async json() { return this.body; }
-    async text() { return JSON.stringify(this.body); }
-  }
-
-  class FakeXMLHttpRequest {
-    constructor(body, responseType = '') {
-      this.body = body;
-      this.responseType = responseType;
-    }
-    open(_method, url) { this.url = url; }
-  }
-  Object.defineProperties(FakeXMLHttpRequest.prototype, {
-    response: {
-      configurable: true,
-      get() { return this.responseType === 'json' ? this.body : JSON.stringify(this.body); },
-    },
-    responseText: {
-      configurable: true,
-      get() { return JSON.stringify(this.body); },
-    },
-  });
-
-  const playerData = () => ({
-    adPlacements: [{ id: 'pre-roll' }],
-    playerAds: [{ id: 'companion' }],
-    playerResponse: { adSlots: [{ id: 'mid-roll' }], videoDetails: { videoId: 'abc' } },
-    entries: [
-      { command: { reelWatchEndpoint: { adClientParams: { isAd: true } } } },
-      { command: { reelWatchEndpoint: { videoId: 'short' } } },
-    ],
-  });
-  const { context } = createSpoofingContext();
-  context.window.location = { hostname: 'www.youtube.com', href: 'https://www.youtube.com/watch?v=abc' };
-  context.window.URL = URL;
-  context.window.Response = FakeResponse;
-  context.window.XMLHttpRequest = FakeXMLHttpRequest;
-
-  runSpoofing(context);
-
-  context.window.ytInitialPlayerResponse = playerData();
-  assert.equal(context.window.ytInitialPlayerResponse.adPlacements, undefined);
-  assert.equal(context.window.ytInitialPlayerResponse.playerAds, undefined);
-  assert.equal(context.window.ytInitialPlayerResponse.playerResponse.adSlots, undefined);
-  assert.equal(context.window.ytInitialPlayerResponse.entries.length, 1);
-
-  const response = new FakeResponse(
-    'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
-    playerData()
-  );
-  const fetched = await response.json();
-  assert.equal(fetched.adPlacements, undefined);
-  assert.equal(fetched.playerResponse.adSlots, undefined);
-
-  // Feed, search and guide responses carry ad slots too.
-  const feedResponse = new FakeResponse(
-    'https://www.youtube.com/youtubei/v1/browse',
-    playerData()
-  );
-  assert.equal((await feedResponse.json()).adPlacements, undefined);
-
-  // The API host serves the same InnerTube payloads as the site host.
-  const apiResponse = new FakeResponse(
-    'https://youtubei.googleapis.com/youtubei/v1/player',
-    playerData()
-  );
-  assert.equal((await apiResponse.json()).playerResponse.adSlots, undefined);
-
-  // Shorts entries carry adClientParams and no other ad key, so the text
-  // pre-check has to let them through for the reel prune to run at all.
-  const reelResponse = new FakeResponse(
-    'https://www.youtube.com/youtubei/v1/reel/reel_item_watch',
-    { entries: playerData().entries }
-  );
-  assert.equal(JSON.parse(await reelResponse.text()).entries.length, 1);
-
-  const unrelatedResponse = new FakeResponse(
-    'https://www.youtube.com/youtubei/v1/log_event',
-    playerData()
-  );
-  assert.equal((await unrelatedResponse.json()).adPlacements.length, 1);
-
-  // A feed entry whose renderer is an ad is dropped whole: deleting just the
-  // renderer key would leave the wrappers behind as an empty card.
-  const feedContents = [
-    { richItemRenderer: { content: { videoRenderer: { videoId: 'real' } } } },
-    { richItemRenderer: { content: { adSlotRenderer: { adSlotMetadata: {} } } } },
-    { richSectionRenderer: { content: { inFeedAdLayoutRenderer: {} } } },
-    // A section mixing real results with an ad must keep the results.
-    {
-      itemSectionRenderer: {
-        contents: [
-          { videoRenderer: { videoId: 'kept' } },
-          { searchPyvRenderer: {} },
-          { videoRenderer: { videoId: 'also-kept' } },
-        ],
-      },
-    },
-  ];
-  const feedEntries = new FakeResponse(
-    'https://www.youtube.com/youtubei/v1/search',
-    { contents: feedContents, adBreakHeartbeatParams: 'x' }
-  );
-  const feed = await feedEntries.json();
-  assert.equal(feed.adBreakHeartbeatParams, undefined);
-  assert.deepEqual(
-    feed.contents.map((entry) => Object.keys(entry)[0]),
-    ['richItemRenderer', 'itemSectionRenderer']
-  );
-  assert.deepEqual(
-    feed.contents[1].itemSectionRenderer.contents.map((item) => item.videoRenderer.videoId),
-    ['kept', 'also-kept']
-  );
-
-  // The text pre-check has to let renderer-only payloads through too.
-  const rendererOnly = new FakeResponse(
-    'https://www.youtube.com/youtubei/v1/browse',
-    { contents: [{ richItemRenderer: { content: { displayAdRenderer: {} } } }] }
-  );
-  assert.equal(JSON.parse(await rendererOnly.text()).contents.length, 0);
-
-  const xhr = new FakeXMLHttpRequest(playerData());
-  xhr.open('POST', '/youtubei/v1/player');
-  const xhrData = JSON.parse(xhr.responseText);
-  assert.equal(xhrData.adPlacements, undefined);
-  assert.equal(xhrData.playerResponse.adSlots, undefined);
-});
-
-test('seeks a server-side YouTube ad using the page player API', () => {
-  let clicked = false;
-  let seekedTo;
-  const player = {
-    getStatsForNerds() { return { debug_info: 'SSAP, AD, pre-roll' }; },
-    getProgressState() { return { current: 2, duration: 15 }; },
-    querySelector() { return { click() { clicked = true; } }; },
-    seekTo(value) { seekedTo = value; },
-  };
-  const { context } = createSpoofingContext();
-  context.window.location = { hostname: 'www.youtube.com', href: 'https://www.youtube.com/watch?v=abc' };
-  context.window.URL = URL;
-  context.window.requestAnimationFrame = callback => callback();
-  context.document.getElementById = id => id === 'movie_player' ? player : null;
-
-  runSpoofing(context);
-
-  assert.equal(clicked, true);
-  assert.equal(seekedTo, 15);
 });
 
 function createOverlay() {

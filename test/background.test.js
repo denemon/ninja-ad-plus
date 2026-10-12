@@ -13,6 +13,7 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
   const storage = {};
   const updates = [];
   const registeredScripts = new Map();
+  const scriptUpdates = [];
   const rulesetFailures = new Map();
   const enabledRulesets = new Set();
   const badge = {};
@@ -79,6 +80,14 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
           registeredScripts.set(script.id, script);
         }
       },
+      async updateContentScripts(scripts) {
+        if (scriptingFailure) throw scriptingFailure;
+        for (const script of scripts) {
+          assert.ok(registeredScripts.has(script.id));
+          scriptUpdates.push(script);
+          registeredScripts.set(script.id, { ...registeredScripts.get(script.id), ...script });
+        }
+      },
       async unregisterContentScripts({ ids }) {
         for (const id of ids) {
           assert.ok(registeredScripts.delete(id), `unregistering unknown script ${id}`);
@@ -104,6 +113,7 @@ function createBackgroundContext({ spoofingRegistered = false } = {}) {
     storage,
     updates,
     registeredScripts,
+    scriptUpdates,
     enabledRulesets,
     badge,
     // Blocks the next getRegisteredContentScripts() call until release() is
@@ -216,18 +226,22 @@ test('turning the extension on registers spoofing in the MAIN world at document_
   const script = registeredScripts.get('spoofing');
   assert.deepEqual(Array.from(script.js), ['spoofing.js']);
   assert.deepEqual(Array.from(script.matches), ['<all_urls>']);
+  assert.deepEqual(Array.from(script.excludeMatches), ['*://*.youtube.com/*', '*://*.youtube-nocookie.com/*']);
   assert.equal(script.world, 'MAIN');
   assert.equal(script.runAt, 'document_start');
   assert.equal(script.persistAcrossSessions, true);
 });
 
-test('re-enabling an already registered script is a no-op', async () => {
-  const { listeners, registeredScripts } = createBackgroundContext({ spoofingRegistered: true });
+test('installation sync migrates a persisted spoofing registration to exclude YouTube', async () => {
+  const { listeners, registeredScripts, scriptUpdates } = createBackgroundContext({ spoofingRegistered: true });
 
-  const response = await sendToggle(listeners, true);
+  await listeners.installed();
 
-  assert.equal(response.status, 'success');
   assert.equal(registeredScripts.size, 1);
+  assert.equal(scriptUpdates.length, 1);
+  assert.deepEqual(Array.from(registeredScripts.get('spoofing').excludeMatches), [
+    '*://*.youtube.com/*', '*://*.youtube-nocookie.com/*',
+  ]);
 });
 
 test('startup sync registers spoofing for a first-run install', async () => {

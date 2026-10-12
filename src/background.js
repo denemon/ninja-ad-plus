@@ -21,6 +21,7 @@ const SPOOFING_SCRIPT = Object.freeze({
   id: 'spoofing',
   js: ['spoofing.js'],
   matches: ['<all_urls>'],
+  excludeMatches: ['*://*.youtube.com/*', '*://*.youtube-nocookie.com/*'],
   runAt: 'document_start',
   world: 'MAIN',
   persistAcrossSessions: true,
@@ -124,14 +125,19 @@ async function applySpoofingState(shouldEnable) {
   });
   const isRegistered = registered.length > 0;
 
-  if (shouldEnable === isRegistered) {
-    return;
-  }
   if (shouldEnable) {
-    await chrome.scripting.registerContentScripts([SPOOFING_SCRIPT]);
+    // Dynamic registrations persist across updates. Refresh existing entries so
+    // installs from before compatibility mode also acquire the exclusions.
+    if (isRegistered) {
+      await chrome.scripting.updateContentScripts([SPOOFING_SCRIPT]);
+    } else {
+      await chrome.scripting.registerContentScripts([SPOOFING_SCRIPT]);
+    }
     return;
   }
-  await chrome.scripting.unregisterContentScripts({ ids: [SPOOFING_SCRIPT.id] });
+  if (isRegistered) {
+    await chrome.scripting.unregisterContentScripts({ ids: [SPOOFING_SCRIPT.id] });
+  }
 }
 
 function getErrorMessage(error) {

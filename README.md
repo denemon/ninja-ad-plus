@@ -2,7 +2,10 @@
 
 *English | [日本語](README.ja.md)*
 
-Chrome Manifest V3 ad-blocking extension. Instead of hard-blocking ad requests (which triggers anti-adblock detection), it redirects ad resources to content-type-appropriate empty responses, returning silent HTTP 200 OK.
+Chrome Manifest V3 ad-blocking extension. On general sites, it redirects matching
+ad resources to local noop files instead of hard-blocking them. Successful loads
+do not guarantee that blocking is undetectable. YouTube uses the compatibility
+behavior below: normal ad playback with automatic use of available skip buttons.
 
 ## How It Works
 
@@ -16,12 +19,13 @@ Standard ad blockers return `ERR_BLOCKED_BY_CLIENT`, which anti-adblock scripts 
 | Stylesheet | `noop.css` | Empty CSS file |
 | Font, media, WebSocket | *(not blocked)* | Nothing can answer these convincingly |
 
-Chrome derives the response `Content-Type` from the noop file's extension, so a
-redirect only stays invisible when the target suits the type that was requested.
+Chrome derives the response `Content-Type` from the noop file's extension, so
+matching the requested type helps avoid load errors but does not make a redirect invisible.
 HTTP 200 is not enough on its own: a stylesheet served as `text/javascript` is
 refused in standards mode, an image fails to decode, a font rejects the
 `document.fonts` promise, and a video fires `error` on the element — the very
-event this extension exists to avoid.
+event this extension tries to avoid. XHR/fetch consumers can also reject the
+response body: `noop.js` is JavaScript, not valid JSON or a real API response.
 
 A DNR rule carries exactly one action, so the target cannot depend on the
 resource type at request time. Types are grouped by the noop that can honestly
@@ -44,8 +48,7 @@ Three consequences worth stating plainly:
   `noop.css`; generic filters simply do not claim the type.
 
 An unmatched type is not a silent failure. No rule matches, the request goes out
-as it normally would, and the page sees exactly what it would see without the
-extension installed — less blocking, nothing to detect.
+as it normally would. That particular request is not modified by this extension.
 
 Exception (`@@`) rules resolve against the **full** set of blockable types, not
 the narrower set above. A block rule costs one rule per group, which is why that
@@ -57,8 +60,28 @@ type it does not claim.
 
 All blocking runs in Chrome's native C++ `declarativeNetRequest` engine. No JavaScript executes per network request.
 
-On YouTube, `youtube.js` automatically clicks ad skip buttons, advances active
-video ads to their end, and removes page ad slots.
+### YouTube Compatibility
+
+When ON, `youtube.js` clicks only visible, enabled native skip buttons during an
+ad. **Ads play until skipping is available; unskippable ads and page ad slots remain.**
+There is no seeking, speed change, ad-data pruning, networking-flag override, or
+ad-element removal. The same behavior applies to YouTube embeds, including
+`youtube-nocookie.com`.
+
+Two guards bypass this extension's network filtering for YouTube:
+priority-4 `allowAllRequests` protects YouTube frame trees (including third-party frames),
+and a priority-3 `initiatorDomains` allow rule covers requests initiated by YouTube even
+outside a frame, such as service-worker requests. The frame guard outranks plain
+allow rules so an embedded player reliably establishes a frame-tree exception.
+These guards do not override other extensions' filtering. `spoofing.js` is excluded from YouTube, with a
+hostname guard inside the script as well. Persisted registrations are refreshed
+on installation, updates, startup, and enabling the extension.
+
+**After updating, reload the extension in `chrome://extensions/`, then close and
+reopen YouTube tabs (and pages containing embeds).** Existing pages retain the
+old injected patches until reloaded. If a warning persists, compare with other
+blockers disabled. This mode reduces interference; it does not guarantee that
+YouTube will never detect automated skipping.
 
 Every component honours the single ON/OFF switch, but by two different
 mechanisms. `youtube.js` runs in the isolated world and watches
@@ -70,7 +93,7 @@ page load onward.
 
 ### Keeping OFF Meaning OFF
 
-One toggle drives four things — two rulesets, the injected script and the badge
+One toggle drives four things — the ruleset, page spoofing, the YouTube skipper and the badge
 — so `background.js` treats the stored value as the single source of truth and
 protects it three ways:
 
@@ -170,7 +193,7 @@ The following domains are excluded from blocking at build time (in `convert.js`)
 
 Two mechanisms use this list, and only one of them is a guarantee:
 
-- **A runtime guard rule** — the single highest-priority (`3`) `allow` rule at
+- **A runtime guard rule** — a high-priority (`3`) `allow` rule at
   the head of the core ruleset, matching on `requestDomains`. This is what
   actually protects those hosts, because it matches the host being requested
   regardless of how the filter was written.
@@ -185,7 +208,8 @@ The scan alone is not sufficient, which is why the guard exists: a generic
 filter like `/pagead/conversion.js` never mentions Google, yet matches
 `https://www.google.com/pagead/conversion.js`. Note that `requestDomains`
 constrains the *requested* host; `initiatorDomains` would constrain the calling
-page instead, which is a different condition and does not protect anything here.
+page instead. The separate YouTube compatibility guards use that distinction to
+also allow traffic to third-party ad hosts while on YouTube.
 
 To modify the whitelist, edit the `WHITELIST_DOMAINS` array in `convert.js` and
 rerun the converter.
@@ -196,7 +220,9 @@ rerun the converter.
 |---|---|---|
 | 1 | Block rule | Redirect to noop file |
 | 2 | Exception (`@@`) rule | Allow (bypasses block) |
-| 3 | Whitelist guard (one rule) | Allow (bypasses everything) |
+| 3 | Target-host whitelist guard | Allow |
+| 3 | YouTube initiator guard | Allow YouTube-initiated requests |
+| 4 | YouTube frame guard | Allow the entire YouTube frame tree |
 
 ### Domain Merging and Chrome's Static Rule Budget
 
@@ -261,8 +287,9 @@ this extension is for.
 
 ### Resource Type Safety
 
-`main_frame` (document) and `popup` resource types are excluded from all rules.
-This prevents the extension from forcibly navigating browser tabs. `font`,
+`main_frame` (document) and `popup` resource types are excluded from redirects.
+The YouTube `allowAllRequests` guard matches frame navigation only to allow it,
+never to redirect it. This prevents forced navigation by the extension. `font`,
 `media` and `websocket` are excluded for the separate reason given above: no
 response this extension can produce would be mistaken for a real one.
 
@@ -277,7 +304,7 @@ ninja-ad-plus/
 │   ├── manifest.json           # MV3 config (permissions, ruleset, service worker)
 │   ├── background.js           # Service worker: ruleset + spoofing toggle, badge, storage sync
 │   ├── spoofing.js             # MAIN-world ad/anti-adblock stubs (registered by background.js)
-│   ├── youtube.js              # YouTube video-ad skipper and page ad cleanup
+│   ├── youtube.js              # YouTube compatibility: click available native skip buttons
 │   ├── popup.html              # Popup UI: toggle switch with status indicator
 │   ├── popup.js                # Popup controller: reads/writes state, sends toggle messages
 │   ├── rules-core.json         # Generated: ~12k rules incl. all exceptions, enabled from stored state
@@ -313,7 +340,7 @@ build inputs cannot drift back into the shipped directory unnoticed.
 ## Security Considerations
 
 - **No remote code execution**: All rules are pre-compiled and bundled. No network fetches at runtime.
-- **Page-context spoofing is switchable**: `spoofing.js` is injected at `document_start` in the page's MAIN world to stub common ad/anti-adblock globals. It is bundled locally, loads no remote code, and is unregistered entirely when the extension is switched off — so a site it breaks can always be recovered by toggling off and reloading.
+- **Page-context spoofing is switchable**: Outside YouTube, `spoofing.js` is injected at `document_start` in the page's MAIN world to stub common ad/anti-adblock globals. It is bundled locally, loads no remote code, and is unregistered entirely when the extension is switched off — so a site it breaks can be recovered by toggling off and reloading.
 - **Bait protection is name-exact**: `spoofing.js` force-shows hidden elements whose class or id looks like ad bait, to defeat dimension probing. Each class token must equal a bait word or be a bait word followed by `-`/`_`, so `address`, `admin-dialog` and `adaptive-layout` are left alone. An open-ended prefix match would force ordinary hidden UI visible with `!important` on every site.
 - **No main_frame redirection**: Document-level rules are explicitly excluded to prevent forced navigation.
 - **Minimal permissions**: Only the four permissions below. `scripting` buys the kill switch for the MAIN-world script and is not used for remote or arbitrary code injection — the only script it ever registers is the bundled `spoofing.js`.

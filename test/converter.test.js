@@ -5,12 +5,12 @@ const test = require('node:test');
 
 const { convertLines, parseLine, assertFitsGuarantee } = require('../convert');
 
-// Every ruleset leads with the whitelist guard rule. These tests are about the
-// rules converted from the input lines, so drop it — while asserting it is
-// there, since it is the only thing protecting the whitelisted hosts.
+// These tests focus on input filters. The three built-in guards are checked
+// separately so they cannot hide incorrect filter conversion.
 function convert(lines) {
   const result = convertLines(lines);
-  const [guard, ...rules] = result.rules;
+  const [guard] = result.rules;
+  const rules = result.rules.filter(rule => rule.priority < 3);
 
   assert.deepEqual(guard.action, { type: 'allow' });
   assert.ok(guard.condition.requestDomains.includes('google.com'));
@@ -18,6 +18,28 @@ function convert(lines) {
 
   return { ...result, rules };
 }
+
+test('YouTube frame and initiator guards override redirects without allowlisting ad hosts globally', () => {
+  const { rules } = convertLines(['||g.doubleclick.net^']);
+  const frames = rules.find(rule => rule.action.type === 'allowAllRequests');
+  const workers = rules.find(rule => rule.action.type === 'allow' && rule.condition.initiatorDomains);
+  assert.ok(frames, 'YouTube frame trees need a network bypass');
+  assert.ok(workers, 'YouTube-initiated requests also need a bypass outside frame trees');
+  assert.deepEqual(frames.condition, {
+    requestDomains: ['youtube.com', 'youtube-nocookie.com'],
+    resourceTypes: ['main_frame', 'sub_frame'],
+  });
+  assert.deepEqual(workers.condition, { initiatorDomains: ['youtube.com', 'youtube-nocookie.com'] });
+  assert.ok(frames.priority > workers.priority);
+  assert.ok(frames.priority > rules[0].priority,
+    'the frame guard must win over a plain allow when loading an embed');
+  const redirects = rules.filter(rule => rule.action.type === 'redirect');
+  assert.equal(redirects.length, 3, 'other sites must retain ad-host filtering');
+  for (const rule of redirects) {
+    assert.ok(frames.priority > rule.priority);
+    assert.ok(workers.priority > rule.priority);
+  }
+});
 
 test('a generic filter cannot reach a whitelisted host', () => {
   // This filter never mentions Google, so the build-time scan cannot catch it,
