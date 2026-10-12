@@ -52,6 +52,7 @@ test('src/ holds only files the packaged extension needs', () => {
     ...manifest.web_accessible_resources.flatMap(entry => entry.resources),
     ...popupAssets(manifest.action.default_popup),
     'spoofing.js', // registered at runtime by background.js, not in the manifest
+    'youtube-player.js', // YouTube-only MAIN-world filter under the same switch
   ]);
 
   const unexpected = fs.readdirSync(ROOT)
@@ -61,7 +62,7 @@ test('src/ holds only files the packaged extension needs', () => {
   assert.deepEqual(unexpected, [], `src/ should not ship unreferenced files: ${unexpected}`);
 });
 
-test('spoofing.js is registered dynamically so the toggle can disable it', () => {
+test('page-context scripts are registered dynamically so the toggle can disable them', () => {
   const manifest = readJson('manifest.json');
   const manifestScripts = manifest.content_scripts.flatMap(script => script.js);
 
@@ -72,6 +73,8 @@ test('spoofing.js is registered dynamically so the toggle can disable it', () =>
   );
   assert.ok(manifest.permissions.includes('scripting'), 'dynamic registration needs "scripting"');
   assert.ok(fs.existsSync(path.join(ROOT, 'spoofing.js')));
+  assert.equal(manifestScripts.includes('youtube-player.js'), false);
+  assert.ok(fs.existsSync(path.join(ROOT, 'youtube-player.js')));
 });
 
 test('every static rule fits inside Chrome\'s guarantee', () => {
@@ -106,7 +109,7 @@ test('no ruleset is enabled from the manifest, so an update cannot revive a stor
   }
 });
 
-test('the whitelist guard outranks every other rule and leads the core ruleset', () => {
+test('the whitelist and YouTube guards lead and outrank filtering rules', () => {
   const manifest = readJson('manifest.json');
   const [core] = manifest.declarative_net_request.rule_resources;
   const rules = readJson(core.path);
@@ -115,9 +118,25 @@ test('the whitelist guard outranks every other rule and leads the core ruleset',
   assert.ok(guard.condition.requestDomains.length > 0, 'the guard matches by requested host');
   assert.equal(guard.action.type, 'allow');
   assert.ok(
-    rules.slice(1).every(rule => rule.priority < guard.priority),
+    rules.slice(3).every(rule => rule.priority < guard.priority),
     'nothing may outrank the guard, or a whitelisted host could still be redirected'
   );
+  assert.deepEqual(rules.slice(1, 3), [
+    {
+      id: 2, priority: 4, action: { type: 'allowAllRequests' },
+      condition: {
+        requestDomains: ['youtube.com', 'youtube-nocookie.com'],
+        resourceTypes: ['main_frame', 'sub_frame'],
+      },
+    },
+    {
+      id: 3, priority: 3, action: { type: 'allow' },
+      condition: { initiatorDomains: ['youtube.com', 'youtube-nocookie.com'] },
+    },
+  ]);
+  const skipper = manifest.content_scripts.find(script => script.js.includes('youtube.js'));
+  assert.deepEqual(skipper.matches, ['*://*.youtube.com/*', '*://*.youtube-nocookie.com/*']);
+  assert.equal(skipper.all_frames, true);
 });
 
 // Chrome types the response from the noop file's extension, so a redirect is
@@ -177,10 +196,8 @@ test('an exception rule can lift every block rule that could apply', () => {
 
   for (const ruleset of manifest.declarative_net_request.rule_resources) {
     for (const rule of readJson(ruleset.path)) {
-      // The whitelist guard is a different mechanism: it covers hosts outright
-      // rather than opposing a URL pattern. Merged block rules also match by
-      // host, but they still have to be liftable by an exception.
-      if (rule.condition.requestDomains && rule.action.type === 'allow') {
+      // Built-in guards cover hosts or frame trees rather than input filters.
+      if (rule.priority >= 3) {
         continue;
       }
       const target = rule.action.type === 'allow' ? allowed : blockable;
@@ -245,7 +262,7 @@ function assertValidRuleset(rules, label, webAccessible) {
     assert.equal(ids.has(rule.id), false, `duplicate rule id ${rule.id}`);
     ids.add(rule.id);
     assert.ok(Number.isInteger(rule.id) && rule.id > 0, `invalid id ${rule.id}`);
-    assert.ok(['allow', 'redirect'].includes(rule.action.type), `invalid action ${rule.id}`);
+    assert.ok(['allow', 'allowAllRequests', 'redirect'].includes(rule.action.type), `invalid action ${rule.id}`);
 
     const condition = rule.condition;
     assert.ok(condition, `missing condition ${rule.id}`);
@@ -260,6 +277,9 @@ function assertValidRuleset(rules, label, webAccessible) {
       for (const domain of condition.requestDomains) {
         assert.match(domain, HOSTNAME, `rule ${rule.id} has an unusable requestDomain ${domain}`);
       }
+    } else if (condition.initiatorDomains && !condition.urlFilter && !condition.regexFilter) {
+      assert.equal(rule.action.type, 'allow', 'only the initiator guard omits a URL condition');
+      for (const domain of condition.initiatorDomains) assert.match(domain, HOSTNAME);
     } else {
       assert.equal(
         Boolean(condition.urlFilter) && Boolean(condition.regexFilter),
@@ -272,11 +292,13 @@ function assertValidRuleset(rules, label, webAccessible) {
       );
     }
 
-    assert.equal(
-      condition.resourceTypes.includes('main_frame'),
-      false,
-      `rule ${rule.id} must not target main_frame`
-    );
+    if (rule.action.type === 'allowAllRequests') {
+      assert.deepEqual(condition.resourceTypes, ['main_frame', 'sub_frame']);
+    } else if (condition.resourceTypes) {
+      assert.equal(condition.resourceTypes.includes('main_frame'), false, `rule ${rule.id} must not target main_frame`);
+    } else {
+      assert.equal(rule.action.type, 'allow', 'redirects must explicitly limit resource types');
+    }
 
     if (condition.urlFilter) {
       assert.match(condition.urlFilter, ASCII_PRINTABLE, `non-ASCII urlFilter ${rule.id}`);

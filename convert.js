@@ -38,6 +38,8 @@ const WHITELIST_DOMAINS = Object.freeze([
   'gemini.google.com', 'bard.google.com',
 ]);
 
+const YOUTUBE_DOMAINS = Object.freeze(['youtube.com', 'youtube-nocookie.com']);
+
 // Match a whitelisted domain only as a whole host: it must start at a host
 // boundary (pattern start, "|", "/", or a subdomain dot) and end at a host
 // terminator. A plain includes() would read gggpht.com as ggpht.com and drop a
@@ -76,8 +78,8 @@ const RESOURCE_TYPE_MAP = Object.freeze({
 // Group order decides what an overflowing ruleset would drop first, so the most
 // valuable noop leads and the cheapest thing to lose is last.
 const NOOP_GROUPS = Object.freeze([
-  // Scripts need parseable JavaScript. The rest have no content requirement and
-  // no load-failure event to observe, so text/javascript is undetectable there.
+  // This is valid JavaScript, not a substitute for an API response. JSON or
+  // binary consumers can still reject it; a successful load is not invisibility.
   Object.freeze({
     path: '/noop.js',
     types: Object.freeze(['script', 'xmlhttprequest', 'ping', 'other', 'object']),
@@ -117,6 +119,7 @@ const DEFAULT_RESOURCE_TYPES = Object.freeze(
 const PRIORITY_BLOCK = 1;
 const PRIORITY_EXCEPTION = 2;
 const PRIORITY_WHITELIST = 3;
+const PRIORITY_YOUTUBE_FRAME = 4;
 
 // A filter that is nothing but ||host^ says exactly what requestDomains says,
 // and a single rule can carry a whole list of hosts. The bundled lists are ~93%
@@ -182,7 +185,7 @@ function assertFitsGuarantee(rules) {
 }
 
 function printSummary(result) {
-  const allowCount = result.rules.filter(r => r.action.type === 'allow').length;
+  const allowCount = result.rules.filter(r => r.action.type === 'allow' || r.action.type === 'allowAllRequests').length;
   const merged = result.rules.filter(r => r.condition.requestDomains && r.action.type === 'redirect');
   const mergedDomains = merged.reduce((total, rule) => total + rule.condition.requestDomains.length, 0);
 
@@ -263,7 +266,28 @@ function convertLines(lines) {
 // path on one host.
 function buildRules(candidates) {
   const { merged, perFilter } = groupBlocks(candidates);
-  const rules = [buildWhitelistGuardRule(1)];
+  const rules = [
+    buildWhitelistGuardRule(1),
+    // Protect the entire YouTube frame tree, including third-party ad frames.
+    // Target-host allowlisting alone leaves their requests redirected to noops.
+    // Outrank plain allow rules so an embed reliably establishes the frame guard.
+    {
+      id: 2,
+      priority: PRIORITY_YOUTUBE_FRAME,
+      action: { type: 'allowAllRequests' },
+      condition: {
+        requestDomains: [...YOUTUBE_DOMAINS],
+        resourceTypes: ['main_frame', 'sub_frame'],
+      },
+    },
+    // Service-worker requests may have no frame; cover the YouTube initiator too.
+    {
+      id: 3,
+      priority: PRIORITY_WHITELIST,
+      action: { type: 'allow' },
+      condition: { initiatorDomains: [...YOUTUBE_DOMAINS] },
+    },
+  ];
 
   for (const candidate of candidates) {
     if (candidate.parsed.isException) {
@@ -353,8 +377,8 @@ function chunk(values, size) {
 
 // The build-time domain scan only catches filters that spell a whitelisted
 // domain out. A generic filter such as /pagead/conversion.js still matches
-// https://www.google.com/pagead/conversion.js, so this single highest-priority
-// rule is what actually protects those hosts. requestDomains matches the host
+// https://www.google.com/pagead/conversion.js, so this high-priority
+// rule protects those hosts. requestDomains matches the host
 // being requested and its subdomains, which is the condition that matters here;
 // initiatorDomains would constrain the calling page instead.
 function buildWhitelistGuardRule(id) {

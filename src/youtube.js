@@ -8,79 +8,37 @@
     '.ytp-skip-ad-button',
     '.videoAdUiSkipButton',
   ].join(',');
-  const AD_ELEMENTS = [
-    '#masthead-ad',
-    '#player-ads',
-    '#shopping-timely-shelf',
-    '.ytp-ad-overlay-container',
-    '.ytp-suggested-action-badge',
-    'ad-slot-renderer',
-    'ytd-ad-slot-renderer',
-    'ytd-action-companion-ad-renderer',
-    'ytd-companion-slot-renderer',
-    'ytd-display-ad-renderer',
-    'ytd-in-feed-ad-layout-renderer',
-    'ytd-merch-shelf-renderer',
-    'ytd-player-legacy-desktop-watch-ads-renderer',
-    'ytd-promoted-sparkles-web-renderer',
-    'ytd-promoted-video-renderer',
-    'ytd-search-pyv-renderer',
-    'ytm-companion-ad-renderer',
-  ].join(',');
-  const AD_CONTAINERS = [
-    '.ytd-shorts',
-    'ytd-rich-item-renderer',
-    'ytm-companion-slot',
-    'ytm-rich-item-renderer',
-  ].join(',');
 
+  // Fallback for ads that reach the player: use the native skip control once
+  // available. Initial player-response filtering runs in youtube-player.js.
   let enabled = false;
+  let storageChanged = false;
   let observer;
   let scheduled = false;
-  let acceleratedVideo;
-  let originalPlaybackRate = 1;
+  let clickedButton;
 
-  function restorePlaybackRate() {
-    if (!acceleratedVideo) return;
-    acceleratedVideo.playbackRate = originalPlaybackRate;
-    acceleratedVideo = undefined;
-  }
-
-  function skipVideoAd() {
-    const player = document.querySelector('#movie_player.ad-showing, #movie_player.ad-interrupting');
-    if (!player) {
-      restorePlaybackRate();
-      return;
+  function isClickable(button) {
+    if (button.getClientRects().length === 0) return false;
+    for (let element = button; element; element = element.parentElement) {
+      if (element.disabled || element.hidden || element.inert ||
+          element.getAttribute('aria-disabled') === 'true') return false;
+      const style = getComputedStyle(element);
+      if (style.display === 'none' || style.visibility !== 'visible' || style.opacity === '0') return false;
     }
-
-    player.querySelector(SKIP_BUTTONS)?.click();
-
-    const video = player.querySelector('video');
-    if (!video) return;
-
-    if (Number.isFinite(video.duration) && video.duration > 0) {
-      video.currentTime = video.duration;
-      return;
-    }
-
-    if (acceleratedVideo !== video) {
-      restorePlaybackRate();
-      acceleratedVideo = video;
-      originalPlaybackRate = video.playbackRate;
-      video.playbackRate = 16;
-    }
-  }
-
-  function removeAdElements() {
-    for (const element of document.querySelectorAll(AD_ELEMENTS)) {
-      (element.closest?.(AD_CONTAINERS) || element).remove();
-    }
+    return true;
   }
 
   function run() {
     if (!enabled) return;
-    skipVideoAd();
-    removeAdElements();
+    const player = document.querySelector('#movie_player.ad-showing, #movie_player.ad-interrupting');
+    const button = Array.from(player?.querySelectorAll(SKIP_BUTTONS) || []).find(isClickable);
+    if (!button) {
+      clickedButton = undefined;
+      return;
+    }
+    if (button === clickedButton) return;
+    clickedButton = button;
+    button.click();
   }
 
   function schedule() {
@@ -97,10 +55,12 @@
     observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ['class'],
+      attributeFilter: ['class', 'style', 'hidden', 'disabled', 'aria-disabled', 'inert'],
       childList: true,
       subtree: true,
     });
+    // CSS transitions can reveal a control without a new DOM mutation.
+    document.addEventListener('timeupdate', schedule, true);
     schedule();
   }
 
@@ -116,16 +76,22 @@
 
     observer?.disconnect();
     observer = undefined;
-    restorePlaybackRate();
+    clickedButton = undefined;
+    document.removeEventListener('DOMContentLoaded', startObserver);
+    document.removeEventListener('timeupdate', schedule, true);
   }
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === 'local' && changes[STORAGE_KEY]) {
+      storageChanged = true;
       setEnabled(Boolean(changes[STORAGE_KEY].newValue));
     }
   });
 
   chrome.storage.local.get({ [STORAGE_KEY]: true }).then((data) => {
-    setEnabled(Boolean(data[STORAGE_KEY]));
+    // A newer storage event wins over an in-flight initial read.
+    if (!storageChanged) setEnabled(Boolean(data[STORAGE_KEY]));
+  }).catch((error) => {
+    console.warn('YouTube state read failed:', error);
   });
 })();

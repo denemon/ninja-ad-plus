@@ -14,13 +14,23 @@
 const CORE_RULESET_ID = 'core';
 const STORAGE_KEY = 'isEnabled';
 
-// spoofing.js runs in the page's MAIN world, where chrome.* APIs are not
-// exposed, so it cannot read the ON/OFF state by itself. Registering and
-// unregistering it here puts it under the same switch as the network rules.
+// MAIN-world scripts cannot read chrome.storage themselves. Registering and
+// unregistering them here puts them under the same switch as the network rules.
 const SPOOFING_SCRIPT = Object.freeze({
   id: 'spoofing',
   js: ['spoofing.js'],
   matches: ['<all_urls>'],
+  excludeMatches: ['*://*.youtube.com/*', '*://*.youtube-nocookie.com/*'],
+  runAt: 'document_start',
+  world: 'MAIN',
+  persistAcrossSessions: true,
+});
+
+const YOUTUBE_PLAYER_SCRIPT = Object.freeze({
+  id: 'youtube-player',
+  js: ['youtube-player.js'],
+  matches: ['*://*.youtube.com/*', '*://*.youtube-nocookie.com/*'],
+  allFrames: true,
   runAt: 'document_start',
   world: 'MAIN',
   persistAcrossSessions: true,
@@ -107,7 +117,8 @@ async function applyRuleState(shouldEnable) {
   const badge = shouldEnable ? BADGE.on : BADGE.off;
 
   await updateRuleset(CORE_RULESET_ID, shouldEnable);
-  await applySpoofingState(shouldEnable);
+  await applyScriptState(SPOOFING_SCRIPT, shouldEnable);
+  await applyScriptState(YOUTUBE_PLAYER_SCRIPT, shouldEnable);
   await chrome.action.setBadgeText({ text: badge.text });
   await chrome.action.setBadgeBackgroundColor({ color: badge.color });
 }
@@ -118,20 +129,25 @@ function updateRuleset(rulesetId, shouldEnable) {
   );
 }
 
-async function applySpoofingState(shouldEnable) {
+async function applyScriptState(script, shouldEnable) {
   const registered = await chrome.scripting.getRegisteredContentScripts({
-    ids: [SPOOFING_SCRIPT.id],
+    ids: [script.id],
   });
   const isRegistered = registered.length > 0;
 
-  if (shouldEnable === isRegistered) {
-    return;
-  }
   if (shouldEnable) {
-    await chrome.scripting.registerContentScripts([SPOOFING_SCRIPT]);
+    // Dynamic registrations persist across updates. Refresh existing entries so
+    // saved registrations follow the current scopes and script files.
+    if (isRegistered) {
+      await chrome.scripting.updateContentScripts([script]);
+    } else {
+      await chrome.scripting.registerContentScripts([script]);
+    }
     return;
   }
-  await chrome.scripting.unregisterContentScripts({ ids: [SPOOFING_SCRIPT.id] });
+  if (isRegistered) {
+    await chrome.scripting.unregisterContentScripts({ ids: [script.id] });
+  }
 }
 
 function getErrorMessage(error) {

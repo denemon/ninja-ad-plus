@@ -2,9 +2,10 @@
 
 *[English](README.md) | 日本語*
 
-Chrome Manifest V3 の広告ブロック拡張機能。広告リクエストを強制ブロックすると
-アンチアドブロック検知に引っかかるため、代わりにコンテンツタイプの合った空レス
-ポンスへリダイレクトし、静かに HTTP 200 OK を返します。
+Chrome Manifest V3 の広告ブロック拡張機能。一般サイトでは一致する広告リクエストを
+ローカルの noop ファイルへリダイレクトします。読み込みが成功しても、検知されない
+保証はありません。YouTube はプレーヤー初期化前に広告データを処理し、残った広告には
+通常のスキップボタンの自動クリックを使います。
 
 ## 仕組み
 
@@ -20,12 +21,13 @@ Chrome Manifest V3 の広告ブロック拡張機能。広告リクエストを�
 | stylesheet | `noop.css` | 空の CSS ファイル |
 | font, media, WebSocket | *(ブロックしない)* | 説得力のある応答を用意できない |
 
-Chrome はレスポンスの `Content-Type` を noop ファイルの拡張子から決めるため、リ
-ダイレクトが不可視でいられるのは**転送先が要求された種別に合っている場合だけ**で
-す。HTTP 200 を返すだけでは足りません。`text/javascript` として配られたスタイル
+Chrome はレスポンスの `Content-Type` を noop ファイルの拡張子から決めるため、
+転送先を要求された種別に合わせると読み込みエラーを減らせますが、不可視にはなりま
+せん。HTTP 200 を返すだけでは足りません。`text/javascript` として配られたスタイル
 シートは標準準拠モードで拒否され、画像はデコードに失敗し、フォントは
 `document.fonts` の Promise を拒否し、動画は要素上で `error` を発火させます。こ
-れはまさに本拡張が避けようとしているイベントです。
+れはまさに本拡張が避けようとしているイベントです。XHR/fetch は本文の形式も検証
+できます。`noop.js` は JavaScript であって、有効な JSON や本来の API 応答ではありません。
 
 DNR のルールはアクションを 1 つしか持てないため、転送先をリクエスト時のリソース
 種別によって切り替えることはできません。そこで種別を「正直に応答できる noop」ご
@@ -48,8 +50,7 @@ DNR のルールはアクションを 1 つしか持てないため、転送先�
   せん。
 
 **一致しない種別は「無音の失敗」ではありません。** どのルールにも一致しないので
-リクエストは通常どおり送出され、ページには拡張機能が入っていない場合とまったく同
-じものが見えます。ブロックは減りますが、検知される材料はありません。
+そのリクエストは通常どおり送出され、本拡張によって変更されません。
 
 例外 (`@@`) ルールは、上記の狭い集合ではなく**ブロックされうる種別の全体**に対し
 て解決されます。ブロックルールはグループごとに 1 本のコストがかかるため集合を絞っ
@@ -58,22 +59,54 @@ DNR のルールはアクションを 1 つしか持てないため、転送先�
 `||x/ad.css^$stylesheet` によるリダイレクトを止められません。priority 2 の
 `allow` は、自分が主張していない種別を上書きできないからです。
 
-ブロック処理はすべて Chrome ネイティブの C++ `declarativeNetRequest` エンジン内
-で走ります。ネットワークリクエストごとに JavaScript が実行されることはありません。
+一般サイトのリダイレクトは Chrome ネイティブの `declarativeNetRequest` エンジンで
+処理します。下記の YouTube プレーヤー応答フィルタは別途ページ内 JavaScript で動作します。
 
-YouTube では `youtube.js` がスキップボタンを自動クリックし、再生中の動画広告を末
-尾まで進め、ページ内の広告枠を除去します。
+### YouTube の動画広告フィルタ
+
+ON のとき、`youtube-player.js` を MAIN world の `document_start` で実行し、
+プレーヤーが最初に読む前に `ytInitialPlayerResponse` の `adPlacements` と `adSlots`
+を同期的に削除します。後から再代入されるデータにも適用します。既知のプレーヤー API
+の fetch/XHR 応答も処理します。fetch は本文を差し替えるため、`json()`、`text()`、
+`arrayBuffer()`、ストリームで読まれる場合にも適用されます。有効な JSON は数値表現や
+XSSI 対策の接頭辞を保ち、広告キーを未使用の `no_ads` に置き換えます。再生計測、
+heartbeat、動画 URL、通信設定は維持します。
+
+対象は YouTube と `youtubei.googleapis.com` の既知のプレーヤー用エンドポイントです。
+fetch 応答は複製をバッファして処理します。不正な JSON、JSON 以外、広告キーのない応答、
+エラー応答はそのまま渡します。メディア自体に挿入された広告や、すべての別通信経路・
+応答形式には対応していません。
+
+プレーヤーに残った広告には、`youtube.js` が**表示済み・有効な通常のスキップボタン**を
+自動クリックします。**このフォールバックではスキップ可能になるまで広告が再生され、
+ページ内広告枠も残ります。** 強制シークや倍速化は行いません。`youtube-nocookie.com`
+を含む埋め込み動画にも適用します。
+
+ルールを 2 本追加し、YouTube を本拡張の通信フィルタから除外します。
+priority 4 の `allowAllRequests` は YouTube のフレームと配下の第三者フレームを許可し、
+priority 3 の `initiatorDomains` allow は Service Worker などフレーム外の YouTube 起点の
+通信も許可します。埋め込み動画でもフレーム配下の除外が確実に適用されるよう、通常の
+allow よりフレームガードを優先します。他の拡張機能のブロックは解除しません。
+`spoofing.js` は YouTube を注入対象から除外し、スクリプト内部にもホスト名ガードを
+設けています。保存済みの登録も
+インストール・更新・起動・ON への切り替え時に更新します。
+
+**更新後は `chrome://extensions/` で拡張機能を再読み込みし、YouTube のタブと埋め込み
+動画のあるページを閉じて開き直してください。ON/OFF 切り替え後も MAIN world の処理を
+反映するため開き直しが必要です。** 既存ページには読み込み直すまで注入済みの処理が
+残ります。冒頭広告の抑制と検知警告は、対象アカウントでの実再生確認が必要です。
+ローカルテストは検知回避を保証しません。警告が続く場合は OFF にして開き直し、比較してください。
 
 すべてのコンポーネントが単一の ON/OFF スイッチに従いますが、その手段は 2 通りで
 す。`youtube.js` は isolated world で動作し `chrome.storage` を直接監視します。
-`spoofing.js` はページの MAIN world で動作し、そこには `chrome.*` API が存在しな
+`spoofing.js` と `youtube-player.js` は MAIN world で動作し、そこには `chrome.*` API が存在しな
 いため自分で状態を読めません。代わりに Service Worker が `chrome.scripting` 経由
 で登録・登録解除します。したがって拡張機能を OFF にすると、次のページ読み込み以
 降はページコンテキストへのパッチ適用も停止します。
 
 ### OFF を OFF のままに保つ
 
-1 つのトグルが 4 つのもの（2 つのルールセット、注入スクリプト、バッジ）を駆動す
+1 つのトグルがルールセット、偽装、動画広告フィルタ、自動スキップ、バッジを駆動す
 るため、`background.js` は保存値を単一の真実の源として扱い、3 通りに保護します。
 
 - **更新の直列化。** `onStartup`、`onInstalled`、トグルメッセージはすべて 1 本の
@@ -176,7 +209,7 @@ AdGuard のリストは uBlock Origin 版 (`/extension/ublock/`) を使ってく
 
 このリストは 2 つの機構で使われますが、**保証を担うのは一方だけです**。
 
-- **実行時のガードルール** — core ルールセットの先頭に置かれた、最高 priority
+- **実行時のガードルール** — core ルールセットの先頭に置かれた、高い priority
   (`3`) の `allow` ルール 1 本で、`requestDomains` で一致します。フィルタの書き方
   に関係なく要求先ホストで一致するため、実際にこれらのホストを保護しているのはこ
   ちらです。
@@ -190,7 +223,8 @@ AdGuard のリストは uBlock Origin 版 (`/extension/ublock/`) を使ってく
 のような汎用フィルタは Google に一言も触れていませんが、
 `https://www.google.com/pagead/conversion.js` に一致します。なお `requestDomains`
 は*要求先*ホストを制約します。`initiatorDomains` は呼び出し元ページを制約する別の
-条件で、ここでは何も保護しません。
+条件です。別途設けた YouTube 互換ガードはこの違いを利用して、YouTube 上では第三者の
+広告ホストへの通信も許可します。
 
 ホワイトリストを変更するには、`convert.js` の `WHITELIST_DOMAINS` 配列を編集して
 コンバーターを再実行してください。
@@ -201,7 +235,9 @@ AdGuard のリストは uBlock Origin 版 (`/extension/ublock/`) を使ってく
 |---|---|---|
 | 1 | ブロックルール | noop ファイルへリダイレクト |
 | 2 | 例外 (`@@`) ルール | allow（ブロックを回避） |
-| 3 | ホワイトリストガード（1 本） | allow（すべてを回避） |
+| 3 | 要求先ホストのホワイトリストガード | allow |
+| 3 | YouTube 起点ガード | YouTube 起点の通信を許可 |
+| 4 | YouTube フレームガード | YouTube のフレーム配下全体を許可 |
 
 ### ドメイン統合と Chrome の静的ルール枠
 
@@ -269,8 +305,9 @@ enabled static rulesets on each extension update."* manifest で有効と記さ�
 
 ### リソース種別の安全性
 
-`main_frame`（文書）と `popup` はすべてのルールから除外されています。これにより拡
-張機能がブラウザタブを強制的に遷移させることを防ぎます。`font`、`media`、
+`main_frame`（文書）と `popup` はリダイレクトから除外されています。YouTube の
+`allowAllRequests` はフレームの読み込みを許可するだけで、転送しません。これにより
+ブラウザタブの強制遷移を防ぎます。`font`、`media`、
 `websocket` は上述の別の理由で除外されています。本拡張が生成できるどのレスポンス
 も、本物と見間違われることがないためです。
 
@@ -283,9 +320,10 @@ enabled static rulesets on each extension update."* manifest で有効と記さ�
 ninja-ad-plus/
 ├── src/                        # ← 読み込み対象: パッケージ化された拡張機能
 │   ├── manifest.json           # MV3 設定（権限、ルールセット、Service Worker）
-│   ├── background.js           # Service Worker: ルールセット/spoofing のトグル、バッジ、storage 同期
+│   ├── background.js           # Service Worker: ルールセット/MAIN スクリプトのトグル、バッジ、storage 同期
 │   ├── spoofing.js             # MAIN world の広告/アンチアドブロックスタブ（background.js が登録）
-│   ├── youtube.js              # YouTube 動画広告スキップとページ内広告除去
+│   ├── youtube-player.js       # MAIN world の初期/API プレーヤー広告フィルタ（動的登録）
+│   ├── youtube.js              # 残った広告に対し、利用可能な通常のスキップボタンをクリック
 │   ├── popup.html              # ポップアップ UI: 状態表示付きトグルスイッチ
 │   ├── popup.js                # ポップアップ制御: 状態の読み書き、トグルメッセージ送信
 │   ├── rules-core.json         # 生成物: 全例外を含む約 1.2 万本、保存状態から有効化
@@ -322,7 +360,7 @@ sips -s format png -z 48  48  icon-source.png --out src/icon48.png
 
 - **リモートコード実行なし**: すべてのルールは事前コンパイルされ同梱されます。実
   行時のネットワーク取得はありません。
-- **ページコンテキストのスプーフィングは切り替え可能**: `spoofing.js` は一般的な
+- **ページコンテキストのスプーフィングは切り替え可能**: YouTube 以外で `spoofing.js` は一般的な
   広告/アンチアドブロックのグローバル変数をスタブ化するため、ページの MAIN world
   に `document_start` で注入されます。ローカルに同梱され、リモートコードを読み込ま
   ず、拡張機能を OFF にすると完全に登録解除されます。したがって、これが壊してしま
@@ -336,7 +374,7 @@ sips -s format png -z 48  48  icon-source.png --out src/icon48.png
   的に除外しています。
 - **最小限の権限**: 下記の 4 権限のみです。`scripting` は MAIN world スクリプトの
   キルスイッチのために取得しており、リモートコードや任意コードの注入には使いませ
-  ん。登録するスクリプトは同梱の `spoofing.js` だけです。
+  ん。登録するのは同梱の `spoofing.js` と `youtube-player.js` です。
 - **ドメインホワイトリスト**: 重要サービス（Google、YouTube）をビルド段階で誤ブ
   ロックから保護しています。
 - **web_accessible_resources**: noop ファイルは全 URL に公開されます（リダイレク
@@ -348,6 +386,6 @@ sips -s format png -z 48  48  icon-source.png --out src/icon48.png
 |---|---|
 | `declarativeNetRequest` | DNR ルールセットの登録と切り替え |
 | `declarativeNetRequestWithHostAccess` | 全 URL へのリダイレクトルール適用 |
-| `scripting` | MAIN world の `spoofing.js` を登録/登録解除し、ON/OFF スイッチを届かせる |
+| `scripting` | 同梱の MAIN world スクリプトを ON/OFF に応じて登録/登録解除する |
 | `storage` | ブラウザ再起動をまたいで ON/OFF 状態を保持 |
 | `host_permissions: <all_urls>` | リダイレクトルールが任意の URL に一致するために必要 |
